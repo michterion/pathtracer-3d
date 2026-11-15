@@ -667,6 +667,14 @@ public:
     }
 };
 
+// Parametry ostrości kaustyki (regulowane z GUI)
+std::atomic<float> g_caustic_blur_cm{0.25f};     // GPU: sigma filtru Gaussa siatki kaustyki [cm]; 0 = brak rozmycia
+std::atomic<float> g_caustic_light_size{0.12f};  // GPU: ułamek promienia źródła emitujący fotony (półcień kaustyki)
+std::atomic<float> g_caustic_gain{1.0f};         // GPU: mnożnik jasności kaustyki
+std::atomic<int>   g_caustic_grid_res{2048};     // GPU: rozdzielczość siatki fotonów (1024 / 2048 / 4096)
+std::atomic<int>   g_manifold_sequences{0};     // CPU (Manifold NEE): liczba sekwencji faset w tabeli bieżącego renderu
+std::atomic<float> g_caustic_cpu_radius{0.028f}; // CPU (BDPT / MLT / MEMLT): promień filtru stożkowego Jensena [m]
+
 // ============================================================================
 // 3. GLOBALNA MAPA FOTONÓW KAUSTYKI (Eliminacja szwów kafelkowania)
 // ============================================================================
@@ -847,7 +855,7 @@ Vec3 ray_color_bdpt(const Ray& r, const HittableList& world, const std::vector<S
         }
 
         if (!is_spec && !photon_map.photons.empty() && (bounce == 0 || last_was_specular)) {
-            Vec3 caustic_flux = photon_map.estimate_radiance(rec.p, rec.normal, 0.028f);
+            Vec3 caustic_flux = photon_map.estimate_radiance(rec.p, rec.normal, g_caustic_cpu_radius.load());
             accumulated_color = accumulated_color + throughput * albedo * caustic_flux;
         }
 
@@ -1008,7 +1016,7 @@ Vec3 evaluate_path_mlt(const Ray& initial_ray, const HittableList& world,
 
             // Global Photon Map caustic estimation (Tylko dla bezpośredniego trafienia oka lub odbicia lustrzanego!)
             if (!photon_map.photons.empty() && (bounce == 0 || last_was_specular)) {
-                Vec3 caustic_flux = photon_map.estimate_radiance(rec.p, rec.normal, 0.028f);
+                Vec3 caustic_flux = photon_map.estimate_radiance(rec.p, rec.normal, g_caustic_cpu_radius.load());
                 accumulated_color = accumulated_color + throughput * albedo * caustic_flux;
             }
 
@@ -1035,215 +1043,856 @@ Vec3 evaluate_path_mlt(const Ray& initial_ray, const HittableList& world,
 }
 
 // ============================================================================
-// 3c. MANIFOLD EXPLORATION (MEMLT / MEPT) - Wenzel Jakob & Steve Marschner (2012)
-// "Manifold Exploration: A Markov Chain Monte Carlo Technique for Rendering Scenes
-// with Difficult Specular Transport", ACM Trans. Graph. 31(4)
+// 3c. ROZMAITOŚĆ ZWIERCIADLANA: MANIFOLD NEXT EVENT ESTIMATION (MNEE)
+// Jakob & Marschner 2012 "Manifold Exploration" (więzy i spacer po rozmaitości),
+// Hanika i in. 2015 "Manifold Next Event Estimation", Zeltner i in. 2020 "Specular Manifold Sampling"
 // ============================================================================
 
-struct CrystalRefractResult {
-    bool hit = false;
-    Vec3 p_enter;
-    Vec3 n_enter;
-    Vec3 p_exit;
-    Vec3 n_exit;
-    Vec3 dir_exit;
-    float path_length = 0.0f;
+// Moduł rozmaitości zwierciadlanej (Specular Manifold) dla szlifowanego kryształu.
+//
+// Zastosowanie obecne  -> Manifold Next Event Estimation (MNEE): w każdym wierzchołku dyfuzyjnym x szukamy
+//                         łańcucha zwierciadlanego x -> kryształ -> y (punkt na źródle światła), czyli ścieżek
+//                         kaustycznych L S+ D E, których zwykły path tracing praktycznie nie znajduje.
+// Rozbudowa do MEMLT   -> te same trzy klocki wystarczają do perturbacji rozmaitości z pracy Jakoba i Marschnera:
+//     1. SpecularManifold::Walk(x', y, seed = kierunek bieżącego łańcucha)  - po przesunięciu wierzchołka
+//        dyfuzyjnego x -> x' (perturbacja soczewki) ponownie łączy ścieżkę z TYM SAMYM punktem światła y,
+//     2. ManifoldSolution::signature                                         - test odwracalności: spacer powrotny
+//        x' -> x musi wrócić do łańcucha o tej samej sygnaturze faset,
+//     3. ManifoldSolution::GeometryTerm() * chain.transmittance              - uogólniony człon geometryczny;
+//        jego stosunek dla ścieżki proponowanej i bieżącej wchodzi do prawdopodobieństwa akceptacji.
+
+constexpr int MANIFOLD_MAX_TIR   = 6;                      // maks. liczba całkowitych odbić wewnętrznych w łańcuchu
+constexpr int MANIFOLD_MAX_VERTS = MANIFOLD_MAX_TIR + 2;   // wejście + odbicia wewnętrzne + wyjście
+
+// Łańcuch zwierciadlany: załamanie na wejściu, k odbić TIR, załamanie na wyjściu
+struct SpecularChain {
+    int      n = 0;                        // liczba wierzchołków zwierciadlanych
+    Vec3     p[MANIFOLD_MAX_VERTS];        // pozycje wierzchołków
+    Vec3     nrm[MANIFOLD_MAX_VERTS];      // zewnętrzne normalne faset
+    uint64_t signature = 0;                // zakodowana sekwencja indeksów faset (tożsamość rozwiązania)
+    Vec3     dir_in;                       // kierunek jednostkowy z punktu startowego do p[0]
+    Vec3     dir_exit;                     // kierunek jednostkowy promienia opuszczającego kryształ
+    float    t_enter = 0.0f;               // odległość od punktu startowego do p[0]
+    float    transmittance = 1.0f;         // iloczyn (1 - F) na obu załamaniach (Schlick, jak w path tracerze)
 };
 
-inline CrystalRefractResult TraceThroughCrystal(
-    const Ray& r_in,
-    const std::shared_ptr<ConvexPolyhedron>& crystal,
-    float ior = 1.530f
-) {
-    CrystalRefractResult res;
-    if (!crystal) return res;
+// Rozwiązanie równania więzów: łańcuch łączący punkt startowy z punktem docelowym
+struct ManifoldSolution {
+    SpecularChain chain;
+    float t_exit = 0.0f;         // odległość od wierzchołka wyjściowego do punktu docelowego
+    float area_per_sr = 0.0f;    // |dP/dω|: pole na płaszczyźnie celu przypadające na jednostkowy kąt bryłowy w punkcie startowym
+    float cos_plane = 0.0f;      // |dir_exit · normalna płaszczyzny celu|
+    uint64_t signature() const { return chain.signature; }
 
-    HitRecord hit_in;
-    if (!crystal->hit(r_in, 0.001f, 1e9f, hit_in)) return res;
-
-    res.hit = true;
-    res.p_enter = hit_in.p;
-    res.n_enter = hit_in.normal;
-
-    Vec3 unit_d = unit_vector(r_in.direction);
-    float cos_in = std::fmin(dot(-unit_d, hit_in.normal), 1.0f);
-    float sin_in = std::sqrt(std::max(0.0f, 1.0f - cos_in * cos_in));
-
-    float eta_in = 1.0f / ior;
-    Vec3 d_int;
-    if (eta_in * sin_in > 1.0f) {
-        // Całkowite odbicie wewnętrzne na wejściu (TIR)
-        d_int = reflect(unit_d, hit_in.normal);
-        res.p_exit = hit_in.p;
-        res.n_exit = hit_in.normal;
-        res.dir_exit = unit_vector(d_int);
-        return res;
-    } else {
-        d_int = refract(unit_d, hit_in.normal, eta_in);
+    // Uogólniony człon geometryczny G(x <-> y) = cosθx * cosθy * dω_x / dA_y.
+    // Bez kryształu redukuje się do klasycznego cosθx * cosθy / r².
+    float GeometryTerm(float cos_x, float cos_y) const {
+        float denom = area_per_sr * cos_plane;
+        return (denom > 1e-12f) ? (cos_x * cos_y / denom) : 0.0f;
     }
-    d_int = unit_vector(d_int);
+};
 
-    Vec3 cur_p = hit_in.p;
-    Vec3 cur_d = d_int;
-    float total_path = 0.0f;
+class SpecularManifold {
+public:
+    const ConvexPolyhedron* crystal = nullptr;
+    float ior = 1.5f;
 
-    // Do 4 wewnętrznych odbić fasetowych diamentu/kryształu (TIR)
-    for (int internal_bounce = 0; internal_bounce < 4; ++internal_bounce) {
-        Ray r_int(cur_p + cur_d * 0.001f, cur_d);
-        HitRecord hit_out;
-        if (!crystal->hit(r_int, 0.001f, 1e9f, hit_out)) {
-            res.p_exit = cur_p + cur_d * 0.05f;
-            res.n_exit = hit_in.normal;
-            res.dir_exit = cur_d;
-            res.path_length = total_path;
-            return res;
+    SpecularManifold(const ConvexPolyhedron* c, float index) : crystal(c), ior(index) {}
+
+    // Deterministyczne śledzenie łańcucha zwierciadlanego (zawsze załamanie, gdy jest możliwe; TIR w przeciwnym razie).
+    // Dokładnie ta sama klasa ścieżek jest wyłączana z path tracera w ray_color_manifold (brak podwójnego liczenia).
+    bool Trace(const Vec3& origin, const Vec3& dir, SpecularChain& c) const {
+        c = SpecularChain();
+        Vec3 d = unit_vector(dir);
+        Vec3 oc = origin - crystal->center;
+        const auto& planes = crystal->planes;
+        const int np = static_cast<int>(planes.size());
+
+        // Wejście z zewnątrz (test slabów z indeksem fasety)
+        float t_en = -1e30f, t_ex = 1e30f;
+        int i_en = -1;
+        for (int k = 0; k < np; ++k) {
+            float denom = dot(planes[k].n, d);
+            float numer = planes[k].d - dot(planes[k].n, oc);
+            if (std::fabs(denom) < 1e-9f) {
+                if (numer < 0.0f) return false;
+                continue;
+            }
+            float t = numer / denom;
+            if (denom < 0.0f) { if (t > t_en) { t_en = t; i_en = k; } }
+            else              { if (t < t_ex) t_ex = t; }
         }
+        if (i_en < 0 || t_en > t_ex || t_en < 1e-4f) return false;
 
-        total_path += (hit_out.p - cur_p).length();
-        Vec3 unit_cur_d = unit_vector(cur_d);
-        float cos_out = std::fmin(dot(-unit_cur_d, hit_out.normal), 1.0f);
-        float sin_out = std::sqrt(std::max(0.0f, 1.0f - cos_out * cos_out));
+        Vec3 n_in = planes[i_en].n;
+        float cos_i = std::fmin(dot(-d, n_in), 1.0f);
+        if (cos_i <= 0.0f) return false;
+        c.transmittance *= (1.0f - schlick_reflectance(cos_i, 1.0f / ior));
 
-        float eta_out = ior;
-        if (eta_out * sin_out > 1.0f) {
-            // Całkowite odbicie wewnętrzne (TIR) wewnątrz kryształu
-            cur_p = hit_out.p;
-            cur_d = unit_vector(reflect(unit_cur_d, hit_out.normal));
-            continue;
-        }
+        Vec3 cur_p = origin + d * t_en;
+        Vec3 cur_d = unit_vector(refract(d, n_in, 1.0f / ior));
+        int cur_idx = i_en;
 
-        // Wyjście z kryształu do powietrza (załamanie na ścianie wyjściowej)
-        Vec3 d_out = refract(unit_cur_d, hit_out.normal, eta_out);
-        res.p_exit = hit_out.p;
-        res.n_exit = hit_out.normal;
-        res.dir_exit = unit_vector(d_out);
-        res.path_length = total_path;
-        return res;
-    }
+        c.dir_in = d;
+        c.t_enter = t_en;
+        c.p[0] = cur_p;
+        c.nrm[0] = n_in;
+        c.n = 1;
+        c.signature = static_cast<uint64_t>(i_en + 1);
 
-    res.p_exit = cur_p;
-    res.n_exit = hit_in.normal;
-    res.dir_exit = cur_d;
-    res.path_length = total_path;
-    return res;
-}
+        for (int tir = 0; tir <= MANIFOLD_MAX_TIR; ++tir) {
+            // Najbliższa faseta wyjściowa (wielościan wypukły: wystarczy minimum po płaszczyznach skierowanych zgodnie z promieniem)
+            Vec3 pc = cur_p - crystal->center;
+            float t_best = 1e30f;
+            int i_best = -1;
+            for (int k = 0; k < np; ++k) {
+                if (k == cur_idx) continue;
+                float denom = dot(planes[k].n, cur_d);
+                if (denom <= 1e-9f) continue;
+                float t = (planes[k].d - dot(planes[k].n, pc)) / denom;
+                if (t < t_best) { t_best = t; i_best = k; }
+            }
+            if (i_best < 0 || t_best <= 0.0f) return false;
 
-// Algorytm WALKMANIFOLD (Jakob & Marschner 2012, Rysunek 4 & Sekcja 4):
-// Wysoce zoptymalizowana metoda Newtona-Raphsona o kwadratowej zbieżności na rozmaitości zwierciadlanej C(x)=0.
-inline bool WalkSpecularManifold(
-    const Vec3& origin,
-    Vec3& inout_dir,
-    const std::shared_ptr<ConvexPolyhedron>& crystal,
-    const Vec3& target_point,
-    const Vec3& target_normal,
-    Vec3& out_final_hit,
-    float tolerance = 2e-3f,
-    int max_iters = 4,
-    float ior = 1.530f
-) {
-    if (!crystal) return false;
+            Vec3 n_out = planes[i_best].n;
+            cur_p = cur_p + cur_d * t_best;
+            cur_idx = i_best;
 
-    Vec3 cur_dir = unit_vector(inout_dir);
-    float beta = 1.0f;
+            c.p[c.n] = cur_p;
+            c.nrm[c.n] = n_out;
+            c.n += 1;
+            c.signature = c.signature * 64u + static_cast<uint64_t>(i_best + 1);
 
-    for (int iter = 0; iter < max_iters; ++iter) {
-        Ray r_cur(origin, cur_dir);
-        auto spec = TraceThroughCrystal(r_cur, crystal, ior);
-        if (!spec.hit) return false;
+            float cos_o = std::fmin(dot(cur_d, n_out), 1.0f);
+            float sin_o = std::sqrt(std::max(0.0f, 1.0f - cos_o * cos_o));
+            if (ior * sin_o > 1.0f) {
+                // Całkowite odbicie wewnętrzne
+                if (tir == MANIFOLD_MAX_TIR) return false;
+                cur_d = unit_vector(reflect(cur_d, n_out));
+                continue;
+            }
 
-        float denom = dot(spec.dir_exit, target_normal);
-        if (std::fabs(denom) < 1e-5f) return false;
-
-        float t = dot(target_point - spec.p_exit, target_normal) / denom;
-        if (t <= 0.001f) return false;
-
-        Vec3 hit_plane = spec.p_exit + spec.dir_exit * t;
-        Vec3 diff = target_point - hit_plane;
-        float err = diff.length();
-
-        if (err < tolerance) {
-            inout_dir = cur_dir;
-            out_final_hit = hit_plane;
+            c.transmittance *= (1.0f - schlick_reflectance(cos_o, ior));
+            c.dir_exit = unit_vector(refract(cur_d, -n_out, ior));
             return true;
         }
+        return false;
+    }
 
-        // Baza styczna na sferze kierunków początkowych
-        Vec3 up = (std::fabs(cur_dir.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
-        Vec3 U = unit_vector(cross(cur_dir, up));
-        Vec3 V = cross(cur_dir, U);
+    // Spacer po rozmaitości (metoda Newtona): szuka kierunku startowego, dla którego promień po przejściu przez
+    // kryształ trafia w punkt `target`. `plane_n` to normalna dowolnej stałej płaszczyzny przechodzącej przez cel.
+    // `seed_dir` to punkt startowy iteracji: promień wskazany przez model wiązki dla MNEE, kierunek bieżącego
+    // łańcucha dla perturbacji MEMLT. Niezerowe `required_signature` ogranicza spacer do jednej sekwencji faset.
+    bool Walk(const Vec3& origin, const Vec3& target, const Vec3& plane_n, const Vec3& seed_dir,
+              ManifoldSolution& out, uint64_t required_signature = 0,
+              float tolerance = 2e-4f, int max_iters = 10) const {
+        Vec3 w = unit_vector(seed_dir);
+        SpecularChain c;
+        Vec3 P;
+        float t_exit = 0.0f, cos_pl = 0.0f;
+        if (!Shoot(origin, w, target, plane_n, c, P, t_exit, cos_pl)) return false;
+        // Spacer ograniczony do jednej składowej rozmaitości (jednej sekwencji faset)
+        if (required_signature != 0 && c.signature != required_signature) return false;
+        float err = (target - P).length();
 
-        // Krok różniczkowy promienia h (Sekcja 3.3 i 4: Jacobian rozmaitości)
-        float h = 1e-4f;
-        Ray r_u(origin, unit_vector(cur_dir + h * U));
-        Ray r_v(origin, unit_vector(cur_dir + h * V));
+        for (int iter = 0; iter < max_iters; ++iter) {
+            Vec3 up = (std::fabs(w.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
+            Vec3 U = unit_vector(cross(w, up));
+            Vec3 V = cross(w, U);
 
-        auto spec_u = TraceThroughCrystal(r_u, crystal, ior);
-        auto spec_v = TraceThroughCrystal(r_v, crystal, ior);
-        if (!spec_u.hit || !spec_v.hit) return false;
+            // Jacobian dP/d(a,b) w bazie stycznej (U, V), liczony w obrębie tej samej sekwencji faset
+            Vec3 Ju, Jv;
+            if (!Differentiate(origin, w, U, target, plane_n, c.signature, P, Ju)) return false;
+            if (!Differentiate(origin, w, V, target, plane_n, c.signature, P, Jv)) return false;
 
-        float denom_u = dot(spec_u.dir_exit, target_normal);
-        float denom_v = dot(spec_v.dir_exit, target_normal);
-        if (std::fabs(denom_u) < 1e-5f || std::fabs(denom_v) < 1e-5f) return false;
+            if (err < tolerance) {
+                out.chain = c;
+                out.t_exit = t_exit;
+                out.cos_plane = cos_pl;
+                out.area_per_sr = cross(Ju, Jv).length();
+                return out.area_per_sr > 1e-9f;
+            }
 
-        float tu = dot(target_point - spec_u.p_exit, target_normal) / denom_u;
-        float tv = dot(target_point - spec_v.p_exit, target_normal) / denom_v;
-        if (tu <= 0.001f || tv <= 0.001f) return false;
+            // Krok Gaussa-Newtona: J * [a, b]^T = target - P
+            Vec3 diff = target - P;
+            float a11 = dot(Ju, Ju), a12 = dot(Ju, Jv), a22 = dot(Jv, Jv);
+            float r1 = dot(diff, Ju), r2 = dot(diff, Jv);
+            float det = a11 * a22 - a12 * a12;
+            if (det < 1e-14f * (a11 * a22 + 1e-20f)) return false;
+            float da = (a22 * r1 - a12 * r2) / det;
+            float db = (a11 * r2 - a12 * r1) / det;
 
-        Vec3 hit_u = spec_u.p_exit + spec_u.dir_exit * tu;
-        Vec3 hit_v = spec_v.p_exit + spec_v.dir_exit * tv;
+            float step_len = std::sqrt(da * da + db * db);
+            if (step_len > 0.5f) { da *= 0.5f / step_len; db *= 0.5f / step_len; }
 
-        Vec3 Ju = (hit_u - hit_plane) / h;
-        Vec3 Jv = (hit_v - hit_plane) / h;
-
-        // Rozwiązanie układu równań normalnych J * [du, dv]^T = diff
-        float a = dot(Ju, Ju);
-        float b = dot(Ju, Jv);
-        float c = dot(Jv, Jv);
-        float ru = dot(diff, Ju);
-        float rv = dot(diff, Jv);
-
-        // Regularyzacja Levenberga-Marquardta (zapobiega osobliwościom na liniach ogniskowych kaustyki)
-        float lambda_d = 1e-4f * (a + c);
-        float a_d = a + lambda_d;
-        float c_d = c + lambda_d;
-
-        float det = a_d * c_d - b * b;
-        if (det < 1e-12f) return false;
-
-        float du = (c_d * ru - b * rv) / det;
-        float dv = (a_d * rv - b * ru) / det;
-
-        // Krok predykcji w przestrzeni stycznej rozmaitości z tłumieniem skoków:
-        if (du * du + dv * dv > 4.0f) {
-            float s = 2.0f / std::sqrt(du * du + dv * dv);
-            du *= s;
-            dv *= s;
-        }
-        Vec3 next_dir = unit_vector(cur_dir + beta * (du * U + dv * V));
-
-        // Krok korekcji: rzutowanie z powrotem na rozmaitość przez raytracing
-        Ray r_next(origin, next_dir);
-        auto spec_next = TraceThroughCrystal(r_next, crystal, ior);
-        if (spec_next.hit) {
-            float d_next = dot(spec_next.dir_exit, target_normal);
-            if (std::fabs(d_next) > 1e-5f) {
-                float t_next = dot(target_point - spec_next.p_exit, target_normal) / d_next;
-                if (t_next > 0.001f) {
-                    Vec3 hit_next = spec_next.p_exit + spec_next.dir_exit * t_next;
-                    float next_err = (target_point - hit_next).length();
-                    if (next_err < err) {
-                        cur_dir = next_dir;
-                        beta = std::min(1.0f, 1.5f * beta);
-                        continue;
+            // Przeszukiwanie liniowe: krok jest przyjmowany tylko wtedy, gdy zmniejsza błąd
+            bool advanced = false;
+            float s = 1.0f;
+            for (int ls = 0; ls < 5; ++ls) {
+                Vec3 w2 = unit_vector(w + s * (da * U + db * V));
+                SpecularChain c2;
+                Vec3 P2;
+                float t2 = 0.0f, cp2 = 0.0f;
+                if (Shoot(origin, w2, target, plane_n, c2, P2, t2, cp2) &&
+                    (required_signature == 0 || c2.signature == required_signature)) {
+                    float err2 = (target - P2).length();
+                    if (err2 < err) {
+                        w = w2; c = c2; P = P2; t_exit = t2; cos_pl = cp2; err = err2;
+                        advanced = true;
+                        break;
                     }
+                }
+                s *= 0.5f;
+            }
+            if (!advanced) return false;
+        }
+        return false;
+    }
+
+    // Losowy kierunek startowy: jednorodnie po dysku sfery otaczającej kryształ widzianym z punktu `origin`
+    Vec3 SampleSeedDirection(const Vec3& origin, std::mt19937& rng) const {
+        std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+        Vec3 axis = unit_vector(crystal->center - origin);
+        Vec3 up = (std::fabs(axis.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
+        Vec3 A = unit_vector(cross(axis, up));
+        Vec3 B = cross(axis, A);
+        float r = crystal->bounding_radius * std::sqrt(dist01(rng));
+        float phi = 6.2831853f * dist01(rng);
+        Vec3 pt = crystal->center + A * (r * std::cos(phi)) + B * (r * std::sin(phi));
+        return unit_vector(pt - origin);
+    }
+
+private:
+    bool Shoot(const Vec3& origin, const Vec3& w, const Vec3& target, const Vec3& plane_n,
+               SpecularChain& c, Vec3& P, float& t_exit, float& cos_plane) const {
+        if (!Trace(origin, w, c)) return false;
+        float denom = dot(c.dir_exit, plane_n);
+        if (std::fabs(denom) < 1e-6f) return false;
+        float t = dot(target - c.p[c.n - 1], plane_n) / denom;
+        if (t <= 1e-4f) return false;
+        P = c.p[c.n - 1] + c.dir_exit * t;
+        t_exit = t;
+        cos_plane = std::fabs(denom);
+        return true;
+    }
+
+    // Pochodna kierunkowa punktu trafienia; różnica skończona brana po tej stronie, po której sekwencja faset się nie zmienia
+    bool Differentiate(const Vec3& origin, const Vec3& w, const Vec3& axis, const Vec3& target, const Vec3& plane_n,
+                       uint64_t signature, const Vec3& P, Vec3& J) const {
+        for (float h : {1e-3f, 2e-4f, 5e-5f}) {
+            for (float sgn : {1.0f, -1.0f}) {
+                SpecularChain c2;
+                Vec3 P2;
+                float t2 = 0.0f, cp2 = 0.0f;
+                if (Shoot(origin, unit_vector(w + (sgn * h) * axis), target, plane_n, c2, P2, t2, cp2) && c2.signature == signature) {
+                    J = (P2 - P) / (sgn * h);
+                    return true;
                 }
             }
         }
+        return false;
+    }
+};
 
-        beta *= 0.5f;
+// Liniowy model fragmentu wiązki opuszczającej kryształ: w płaszczyźnie odniesienia sekwencji promień
+// przechodzący przez punkt q = (qu, qv) ma nachylenie względem osi wiązki
+//     s = A*q + b + C*(y - środek źródła) + d*(ior - ior bazowy),
+// czyli model uwzględnia konkretny punkt na źródle światła i długość fali danej próbki.
+struct ManifoldBeam {
+    float a11 = 0.0f, a12 = 0.0f, a21 = 0.0f, a22 = 0.0f;
+    float b1 = 0.0f, b2 = 0.0f;
+    Vec3  c1, c2;                                                 // zależność nachylenia od położenia punktu na źródle
+    float d1 = 0.0f, d2 = 0.0f;                                   // zależność nachylenia od współczynnika załamania
+    float residual = 0.0f;                                        // typowa odchyłka nachylenia od modelu (3 x RMS)
+    float u_min = 0.0f, u_max = 0.0f, v_min = 0.0f, v_max = 0.0f; // zakres q objęty tym fragmentem
+
+    // Punkt q płaszczyzny odniesienia, przez który według modelu przechodzi promień do punktu (vu, vv, z)
+    // podanego w układzie sekwencji. Zwraca też normę odwrotności odwzorowania (do tolerancji).
+    bool Locate(float vu, float vv, float z, const Vec3& y_off, float d_ior, float& qu, float& qv, float& inv_norm) const {
+        float lu = vu - z * (b1 + dot(c1, y_off) + d1 * d_ior);
+        float lv = vv - z * (b2 + dot(c2, y_off) + d2 * d_ior);
+        float m11 = 1.0f + z * a11, m12 = z * a12, m21 = z * a21, m22 = 1.0f + z * a22;
+        float det = m11 * m22 - m12 * m21;
+        if (std::fabs(det) <= 1e-4f) return false;
+        qu = (m22 * lu - m12 * lv) / det;
+        qv = (m11 * lv - m21 * lu) / det;
+        inv_norm = (std::fabs(m11) + std::fabs(m12) + std::fabs(m21) + std::fabs(m22)) / std::fabs(det);
+        return true;
     }
 
-    return false;
+    // Czy fragment wiązki może obejmować ten punkt? Jeśli tak, (qu, qv) jest punktem startowym dla spaceru.
+    bool Covers(float vu, float vv, float z, const Vec3& y_off, float d_ior, float& qu, float& qv) const {
+        float inv_norm = 0.0f;
+        if (!Locate(vu, vv, z, y_off, d_ior, qu, qv, inv_norm)) {
+            // Ognisko wiązki: model nie rozstrzyga, przyjmujemy środek fragmentu
+            qu = 0.5f * (u_min + u_max);
+            qv = 0.5f * (v_min + v_max);
+            return true;
+        }
+        float tol = inv_norm * (1.5f * residual * z + 0.002f);
+        float pad_u = 0.05f * (u_max - u_min) + 0.003f + tol;
+        float pad_v = 0.05f * (v_max - v_min) + 0.003f + tol;
+        if (qu < u_min - pad_u || qu > u_max + pad_u || qv < v_min - pad_v || qv > v_max + pad_v) return false;
+        qu = std::clamp(qu, u_min, u_max);
+        qv = std::clamp(qv, v_min, v_max);
+        return true;
+    }
+};
+
+struct ManifoldBeamRay {
+    float qu, qv, su, sv;   // położenie w płaszczyźnie odniesienia i nachylenie promienia
+    Vec3  y_off;            // położenie punktu na źródle względem jego środka
+    float d_ior;            // odchyłka współczynnika załamania (dyspersja)
+};
+
+// Dopasowanie modelu liniowego metodą najmniejszych kwadratów do zbioru promieni wiązki
+inline ManifoldBeam FitManifoldBeam(const std::vector<ManifoldBeamRay>& rays) {
+    ManifoldBeam m;
+    constexpr int NF = 7;   // cechy: qu, qv, 1, y_off.x, y_off.y, y_off.z, d_ior
+    const double N = static_cast<double>(rays.size());
+
+    bool fitted = false;
+    if (rays.size() >= 24) {
+        double M[NF][NF] = {}, Ru[NF] = {}, Rv[NF] = {};
+        for (const auto& r : rays) {
+            double f[NF] = {r.qu, r.qv, 1.0, r.y_off.x, r.y_off.y, r.y_off.z, r.d_ior};
+            for (int a = 0; a < NF; ++a) {
+                Ru[a] += f[a] * r.su;
+                Rv[a] += f[a] * r.sv;
+                for (int b = 0; b < NF; ++b) M[a][b] += f[a] * f[b];
+            }
+        }
+        // Regularyzacja grzbietowa: cechy o zerowej wariancji (źródło punktowe, brak dyspersji) dostają współczynnik 0
+        double trace = 0.0;
+        for (int a = 0; a < NF; ++a) trace += M[a][a];
+        for (int a = 0; a < NF; ++a) M[a][a] += 1e-9 * trace + 1e-14;
+
+        // Eliminacja Gaussa z wyborem elementu głównego (dwie prawe strony jednocześnie)
+        bool ok = true;
+        for (int col = 0; col < NF && ok; ++col) {
+            int piv = col;
+            for (int r = col + 1; r < NF; ++r) if (std::fabs(M[r][col]) > std::fabs(M[piv][col])) piv = r;
+            if (std::fabs(M[piv][col]) < 1e-18) { ok = false; break; }
+            if (piv != col) {
+                for (int k = 0; k < NF; ++k) std::swap(M[piv][k], M[col][k]);
+                std::swap(Ru[piv], Ru[col]);
+                std::swap(Rv[piv], Rv[col]);
+            }
+            for (int r = col + 1; r < NF; ++r) {
+                double fct = M[r][col] / M[col][col];
+                for (int k = col; k < NF; ++k) M[r][k] -= fct * M[col][k];
+                Ru[r] -= fct * Ru[col];
+                Rv[r] -= fct * Rv[col];
+            }
+        }
+        if (ok) {
+            double wu[NF], wv[NF];
+            for (int r = NF - 1; r >= 0; --r) {
+                double su = Ru[r], sv = Rv[r];
+                for (int k = r + 1; k < NF; ++k) { su -= M[r][k] * wu[k]; sv -= M[r][k] * wv[k]; }
+                wu[r] = su / M[r][r];
+                wv[r] = sv / M[r][r];
+            }
+            m.a11 = static_cast<float>(wu[0]); m.a12 = static_cast<float>(wu[1]); m.b1 = static_cast<float>(wu[2]);
+            m.a21 = static_cast<float>(wv[0]); m.a22 = static_cast<float>(wv[1]); m.b2 = static_cast<float>(wv[2]);
+            m.c1 = Vec3(static_cast<float>(wu[3]), static_cast<float>(wu[4]), static_cast<float>(wu[5]));
+            m.c2 = Vec3(static_cast<float>(wv[3]), static_cast<float>(wv[4]), static_cast<float>(wv[5]));
+            m.d1 = static_cast<float>(wu[6]);
+            m.d2 = static_cast<float>(wv[6]);
+            fitted = true;
+        }
+    }
+    if (!fitted) {
+        // Za mało promieni na pełne dopasowanie: stałe nachylenie równe średniej
+        double su = 0.0, sv = 0.0;
+        for (const auto& r : rays) { su += r.su; sv += r.sv; }
+        m.b1 = static_cast<float>(su / N);
+        m.b2 = static_cast<float>(sv / N);
+    }
+
+    m.u_min = m.v_min = 1e30f;
+    m.u_max = m.v_max = -1e30f;
+    double sq_sum = 0.0;
+    for (const auto& r : rays) {
+        float eu = m.a11 * r.qu + m.a12 * r.qv + m.b1 + dot(m.c1, r.y_off) + m.d1 * r.d_ior - r.su;
+        float ev = m.a21 * r.qu + m.a22 * r.qv + m.b2 + dot(m.c2, r.y_off) + m.d2 * r.d_ior - r.sv;
+        sq_sum += static_cast<double>(eu) * eu + static_cast<double>(ev) * ev;
+        m.u_min = std::fmin(m.u_min, r.qu); m.u_max = std::fmax(m.u_max, r.qu);
+        m.v_min = std::fmin(m.v_min, r.qv); m.v_max = std::fmax(m.v_max, r.qv);
+    }
+    // Odporna miara błędu modelu: 3 x RMS. Promienie tuż przy kącie granicznym mają nieograniczony błąd nachylenia,
+    // ale ich przepuszczalność Fresnela dąży do zera, więc nie mogą dyktować tolerancji.
+    m.residual = 3.0f * static_cast<float>(std::sqrt(sq_sum / N));
+    return m;
+}
+
+// Sekwencja faset, przez którą światło danego źródła faktycznie przechodzi przez kryształ, wraz z modelem
+// wiązki opuszczającej kryształ w stronę odbiornika. Przy płaskich fasetach każdej sekwencji odpowiada co najwyżej
+// jedno rozwiązanie równania więzów, więc zamiast losować punkty startowe wyliczamy wszystkie sekwencje.
+struct ManifoldSequence {
+    uint64_t signature = 0;      // sekwencja faset w kolejności od odbiornika (zgodna z SpecularChain::signature)
+    int      count = 0;          // liczba próbek (miara energii niesionej przez sekwencję)
+    Vec3     origin, axis, U, V; // układ odniesienia wiązki: punkt, oś i baza płaszczyzny odniesienia
+    float    reach_radius = 0.0f; // stożek zasięgu wiązki: promień przekroju przy krysztale...
+    float    reach_slope = 0.0f;  // ...i maksymalne nachylenie promieni względem osi
+    ManifoldBeam whole;           // zgrubny model całej wiązki (pierwsze przybliżenie położenia)
+    std::vector<ManifoldBeam> cells; // dokładne modele fragmentów wiązki
+    int      grid = 1;            // siatka grid x grid komórek w płaszczyźnie odniesienia
+    std::vector<int> cell_index;  // komórka siatki -> indeks w `cells` (pusta komórka wskazuje najbliższą niepustą)
+
+    int CellAt(float qu, float qv) const {
+        float du = std::max(1e-6f, whole.u_max - whole.u_min);
+        float dv = std::max(1e-6f, whole.v_max - whole.v_min);
+        int cu = std::clamp(static_cast<int>((qu - whole.u_min) / du * grid), 0, grid - 1);
+        int cv = std::clamp(static_cast<int>((qv - whole.v_min) / dv * grid), 0, grid - 1);
+        return cell_index[static_cast<size_t>(cv) * grid + cu];
+    }
+
+    // Wyznacza punkty startowe spaceru dla punktu odbiornika x: najpierw z komórki wskazanej przez model,
+    // potem z trzech najbliższych komórek sąsiednich (ich modele dają nieco inne promienie, co ratuje rozwiązania leżące tuż przy
+    // krawędziach faset). Zwraca liczbę punktów; 0 oznacza, że wiązka nie obejmuje punktu x.
+    static constexpr int MAX_SEEDS = 4;
+    int FindSeeds(const Vec3& x, const Vec3& y_off, float d_ior, Vec3* seeds) const {
+        Vec3 v = x - origin;
+        float z = dot(v, axis);
+        if (z <= 0.0f) return 0;
+        // 1. Stożek zasięgu (bardzo tani test)
+        float rho2 = v.length_squared() - z * z;
+        float lim = reach_radius + z * reach_slope;
+        if (rho2 > lim * lim) return 0;
+
+        // 2. Zgrubne położenie z modelu całej wiązki, potem doprecyzowanie modelami komórek
+        float vu = dot(v, U), vv = dot(v, V);
+        float qu = 0.5f * (whole.u_min + whole.u_max), qv = 0.5f * (whole.v_min + whole.v_max), inv_norm = 0.0f;
+        whole.Locate(vu, vv, z, y_off, d_ior, qu, qv, inv_norm);
+        int ci = CellAt(qu, qv);
+        int prev = ci;
+        for (int hop = 0; hop < 6; ++hop) {
+            float qu2 = qu, qv2 = qv;
+            if (!cells[ci].Locate(vu, vv, z, y_off, d_ior, qu2, qv2, inv_norm)) break;
+            int cj = CellAt(qu2, qv2);
+            if (cj == ci) break;
+            prev = ci;
+            ci = cj;
+        }
+
+        // 3. Test dokładny w znalezionej komórce (oraz w poprzedniej, gdy iteracja oscyluje na granicy komórek)
+        float q0u = qu, q0v = qv;
+        if (!cells[ci].Covers(vu, vv, z, y_off, d_ior, qu, qv)) {
+            if (prev == ci || !cells[prev].Covers(vu, vv, z, y_off, d_ior, qu, qv)) return 0;
+            ci = prev;
+        }
+        int n = 0;
+        seeds[n++] = origin + U * qu + V * qv;
+
+        // 4. Punkty zapasowe z sąsiednich komórek siatki
+        if (grid > 1) {
+            float du = std::max(1e-6f, whole.u_max - whole.u_min);
+            float dv = std::max(1e-6f, whole.v_max - whole.v_min);
+            int cu = std::clamp(static_cast<int>((q0u - whole.u_min) / du * grid), 0, grid - 1);
+            int cv = std::clamp(static_cast<int>((q0v - whole.v_min) / dv * grid), 0, grid - 1);
+            // Trzej sąsiedzi po tej stronie komórki, po której leży punkt q
+            float fu = (q0u - whole.u_min) / du * grid - static_cast<float>(cu);
+            float fv = (q0v - whole.v_min) / dv * grid - static_cast<float>(cv);
+            int ou = (fu >= 0.5f) ? 1 : -1;
+            int ov = (fv >= 0.5f) ? 1 : -1;
+            const int offs[3][2] = {{ou, 0}, {0, ov}, {ou, ov}};
+            int used[MAX_SEEDS];
+            int n_used = 0;
+            used[n_used++] = ci;
+            for (const auto& off : offs) {
+                int nu = cu + off[0], nv = cv + off[1];
+                if (nu < 0 || nv < 0 || nu >= grid || nv >= grid) continue;
+                int cj = cell_index[static_cast<size_t>(nv) * grid + nu];
+                bool seen = false;
+                for (int k = 0; k < n_used; ++k) seen = seen || (used[k] == cj);
+                if (seen) continue;
+                used[n_used++] = cj;
+                float nqu = 0.0f, nqv = 0.0f;
+                if (cells[cj].Covers(vu, vv, z, y_off, d_ior, nqu, nqv)) seeds[n++] = origin + U * nqu + V * nqv;
+            }
+        }
+        return n;
+    }
+};
+
+// Kontekst kaustyki manifoldowej przekazywany do ewaluatora ścieżek
+struct ManifoldCausticContext {
+    const ConvexPolyhedron* crystal = nullptr;
+    const Material* crystal_material = nullptr;   // do rozpoznawania trafień w kryształ w path tracerze
+    float base_ior = 1.5f;
+    float dispersion = 0.0f;
+    float light_size = 1.0f;     // ułamek promienia źródła emitujący światło kaustyki (0 = punktowe, 1 = fizyczny emiter)
+    std::vector<std::vector<ManifoldSequence>> light_sequences;   // tabela sekwencji dla każdego źródła światła
+};
+
+
+inline uint64_t ReverseChainSignature(uint64_t s) {
+    uint64_t r = 0;
+    while (s) { r = r * 64u + (s % 64u); s /= 64u; }
+    return r;
+}
+
+// Wyznacza tabelę sekwencji faset dla źródła światła, śledząc promienie od światła przez kryształ.
+// Wykonywane raz przed renderem (ułamek sekundy).
+inline std::vector<ManifoldSequence> BuildManifoldSequences(const ManifoldCausticContext& ctx, const Sphere& light,
+                                                            int samples = 1000000, size_t max_sequences = 1024) {
+    struct Sample { uint64_t sig; Vec3 p; Vec3 d; Vec3 y_off; float d_ior; };
+    std::vector<Sample> smp;
+    smp.reserve(samples / 2);
+    std::mt19937 rng(20240611u);
+    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+    bool point_light = (ctx.light_size < 1e-3f);
+
+    for (int i = 0; i < samples; ++i) {
+        float ior = ctx.base_ior;
+        if (ctx.dispersion > 1e-4f) ior += (2.0f * dist01(rng) - 1.0f) * ctx.dispersion;
+        SpecularManifold manifold(ctx.crystal, ior);
+
+        Vec3 y = light.center;
+        if (!point_light) y = y + (light.radius * ctx.light_size) * random_unit_vector(rng);
+
+        SpecularChain c;
+        if (!manifold.Trace(y, manifold.SampleSeedDirection(y, rng), c)) continue;
+        smp.push_back({ReverseChainSignature(c.signature), c.p[c.n - 1], c.dir_exit, y - light.center, ior - ctx.base_ior});
+    }
+
+    std::sort(smp.begin(), smp.end(), [](const Sample& a, const Sample& b) { return a.sig < b.sig; });
+
+    std::vector<ManifoldSequence> out;
+    for (size_t i = 0; i < smp.size();) {
+        size_t j = i;
+        Vec3 sum_p(0.0f, 0.0f, 0.0f), sum_d(0.0f, 0.0f, 0.0f);
+        while (j < smp.size() && smp[j].sig == smp[i].sig) { sum_p = sum_p + smp[j].p; sum_d = sum_d + smp[j].d; ++j; }
+        int count = static_cast<int>(j - i);
+        if (count >= 2 && sum_d.length_squared() > 1e-12f) {
+            ManifoldSequence s;
+            s.signature = smp[i].sig;
+            s.count = count;
+            s.origin = sum_p / static_cast<float>(count);
+            s.axis = unit_vector(sum_d);
+            Vec3 up = (std::fabs(s.axis.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
+            s.U = unit_vector(cross(s.axis, up));
+            s.V = cross(s.axis, s.U);
+
+            // Próbki sprowadzone do płaszczyzny odniesienia: położenie q = (qu, qv) i nachylenie (su, sv)
+            std::vector<ManifoldBeamRay> rays;
+            rays.reserve(count);
+            for (size_t k = i; k < j; ++k) {
+                float dz = dot(smp[k].d, s.axis);
+                if (dz < 0.05f) continue;
+                Vec3 rel = smp[k].p - s.origin;
+                float su = dot(smp[k].d, s.U) / dz, sv = dot(smp[k].d, s.V) / dz;
+                float pz = dot(rel, s.axis);
+                rays.push_back({dot(rel, s.U) - pz * su, dot(rel, s.V) - pz * sv, su, sv, smp[k].y_off, smp[k].d_ior});
+            }
+            if (rays.size() >= 2) {
+                s.whole = FitManifoldBeam(rays);
+
+                // Stożek zasięgu: promień przekroju i 99,5 percentyl nachylenia (promienie skrajne, tuż przy kącie
+                // granicznym, mają dowolnie duże nachylenie i znikomą energię)
+                std::vector<float> slopes;
+                slopes.reserve(rays.size());
+                for (const auto& r : rays) {
+                    s.reach_radius = std::fmax(s.reach_radius, std::sqrt(r.qu * r.qu + r.qv * r.qv));
+                    slopes.push_back(std::sqrt(r.su * r.su + r.sv * r.sv));
+                }
+                size_t nth = static_cast<size_t>(0.995 * static_cast<double>(slopes.size() - 1));
+                std::nth_element(slopes.begin(), slopes.begin() + nth, slopes.end());
+                s.reach_slope = slopes[nth] * 1.10f + 0.02f;
+                s.reach_radius = s.reach_radius * 1.05f + 0.01f;
+
+                // Siatka komórek: załamanie jest silnie nieliniowe na dużych fasetach, więc model liniowy
+                // dopasowujemy lokalnie. Im więcej próbek, tym gęstsza siatka.
+                s.grid = std::clamp(static_cast<int>(std::sqrt(static_cast<float>(rays.size()) / 64.0f)), 1, 8);
+                std::vector<std::vector<ManifoldBeamRay>> buckets(static_cast<size_t>(s.grid) * s.grid);
+                float du = std::max(1e-6f, s.whole.u_max - s.whole.u_min);
+                float dv = std::max(1e-6f, s.whole.v_max - s.whole.v_min);
+                for (const auto& r : rays) {
+                    int cu = std::clamp(static_cast<int>((r.qu - s.whole.u_min) / du * s.grid), 0, s.grid - 1);
+                    int cv = std::clamp(static_cast<int>((r.qv - s.whole.v_min) / dv * s.grid), 0, s.grid - 1);
+                    buckets[static_cast<size_t>(cv) * s.grid + cu].push_back(r);
+                }
+                s.cell_index.assign(buckets.size(), -1);
+                for (size_t bi = 0; bi < buckets.size(); ++bi) {
+                    if (buckets[bi].empty()) continue;
+                    s.cell_index[bi] = static_cast<int>(s.cells.size());
+                    s.cells.push_back(FitManifoldBeam(buckets[bi]));
+                }
+                // Puste komórki siatki wskazują model najbliższej niepustej, żeby wyszukiwanie mogło przez nie przejść
+                std::vector<int> filled = s.cell_index;
+                for (int gv = 0; gv < s.grid; ++gv) {
+                    for (int gu = 0; gu < s.grid; ++gu) {
+                        if (s.cell_index[static_cast<size_t>(gv) * s.grid + gu] >= 0) continue;
+                        int best = -1, best_d = 1 << 30;
+                        for (int hv = 0; hv < s.grid; ++hv) {
+                            for (int hu = 0; hu < s.grid; ++hu) {
+                                int idx = s.cell_index[static_cast<size_t>(hv) * s.grid + hu];
+                                int d2 = (hu - gu) * (hu - gu) + (hv - gv) * (hv - gv);
+                                if (idx >= 0 && d2 < best_d) { best_d = d2; best = idx; }
+                            }
+                        }
+                        filled[static_cast<size_t>(gv) * s.grid + gu] = best;
+                    }
+                }
+                s.cell_index = filled;
+                out.push_back(s);
+            }
+        }
+        i = j;
+    }
+
+    std::sort(out.begin(), out.end(), [](const ManifoldSequence& a, const ManifoldSequence& b) { return a.count > b.count; });
+    if (out.size() > max_sequences) out.resize(max_sequences);
+    return out;
+}
+
+// Manifold Next Event Estimation: suma po wszystkich sekwencjach faset, których wiązka obejmuje punkt x.
+// Zwraca napromienienie kaustyczne podzielone przez π: wynik mnoży się przez throughput * albedo.
+inline Vec3 EstimateManifoldCaustic(const ManifoldCausticContext& ctx, const HittableList& world,
+                                    const std::vector<Sphere>& light_sources,
+                                    const Vec3& x, const Vec3& n_x, std::mt19937& rng) {
+    Vec3 result(0.0f, 0.0f, 0.0f);
+    if (!ctx.crystal) return result;
+    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+
+    // Kryształ w całości pod horyzontem powierzchni -> brak kaustyki
+    if (dot(ctx.crystal->center - x, n_x) < -ctx.crystal->bounding_radius) return result;
+
+    for (size_t li = 0; li < light_sources.size() && li < ctx.light_sequences.size(); ++li) {
+        const auto& light = light_sources[li];
+        const auto& sequences = ctx.light_sequences[li];
+        if (sequences.empty()) continue;
+
+        // Długość fali ścieżki (dyspersja Cauchy'ego, identycznie jak w materiale Dielectric)
+        float ior = ctx.base_ior;
+        Vec3 spec_color(1.0f, 1.0f, 1.0f);
+        if (ctx.dispersion > 1e-4f) {
+            float lambda = dist01(rng);
+            ior = ctx.base_ior + (2.0f * lambda - 1.0f) * ctx.dispersion;
+            float wr = std::exp(-((lambda - 0.15f) * (lambda - 0.15f)) / 0.14f);
+            float wg = std::exp(-((lambda - 0.50f) * (lambda - 0.50f)) / 0.14f);
+            float wb = std::exp(-((lambda - 0.85f) * (lambda - 0.85f)) / 0.14f);
+            Vec3 spec(wr, wg, wb);
+            float avg = (spec.x + spec.y + spec.z) / 3.0f;
+            if (avg > 1e-4f) spec = spec / avg;
+            float blend = std::clamp(ctx.dispersion * 10.0f, 0.0f, 1.0f);
+            spec_color = (1.0f - blend) * Vec3(1.0f, 1.0f, 1.0f) + blend * spec;
+        }
+        SpecularManifold manifold(ctx.crystal, ior);
+
+        // Punkt na źródle światła. Emiter zmniejszony do ułamka promienia zachowuje pełną moc źródła.
+        // Próbkujemy tylko czaszę sfery, z której kryształ może być widoczny (reszta ma zerowy wkład).
+        bool point_light = (ctx.light_size < 1e-3f);
+        Vec3 n_y(0.0f, 1.0f, 0.0f);
+        Vec3 y = light.center;
+        float cap_fraction = 1.0f;
+        if (!point_light) {
+            float r_emit = light.radius * ctx.light_size;
+            Vec3 to_crystal = ctx.crystal->center - light.center;
+            float d_lc = to_crystal.length();
+            if (d_lc < 1e-4f) continue;
+            Vec3 w_axis = to_crystal / d_lc;
+            float cos_min = std::clamp((r_emit - ctx.crystal->bounding_radius) / d_lc, -1.0f, 1.0f);
+            cap_fraction = 0.5f * (1.0f - cos_min);
+            float cos_t = 1.0f - dist01(rng) * (1.0f - cos_min);
+            float sin_t = std::sqrt(std::max(0.0f, 1.0f - cos_t * cos_t));
+            float phi = 6.2831853f * dist01(rng);
+            Vec3 up_l = (std::fabs(w_axis.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
+            Vec3 a_l = unit_vector(cross(w_axis, up_l));
+            Vec3 b_l = cross(w_axis, a_l);
+            n_y = w_axis * cos_t + a_l * (sin_t * std::cos(phi)) + b_l * (sin_t * std::sin(phi));
+            y = light.center + r_emit * n_y;
+        }
+        Vec3 to_light = y - ctx.crystal->center;
+        if (to_light.length_squared() < 1e-8f) continue;
+        Vec3 plane_n = unit_vector(to_light);
+
+        float r2 = light.radius * light.radius;
+        float light_weight = point_light ? (3.14159265f * r2) : (4.0f * 3.14159265f * r2 * cap_fraction);
+        Vec3 Le = light.mat->emitted(y);
+        Vec3 y_off = y - light.center;
+        float d_ior = ior - ctx.base_ior;
+
+        for (const auto& seq : sequences) {
+            // 1. Punkt startowy z modelu wiązki; sekwencje, których wiązka nie obejmuje punktu x, odpadają tutaj
+            Vec3 seeds[ManifoldSequence::MAX_SEEDS];
+            int n_seeds = seq.FindSeeds(x, y_off, d_ior, seeds);
+            if (n_seeds == 0) continue;
+
+            // 2. Spacer po rozmaitości ograniczony do tej sekwencji faset (co najwyżej jedno rozwiązanie)
+            ManifoldSolution sol;
+            bool found = false;
+            for (int k = 0; k < n_seeds && !found; ++k) {
+                found = manifold.Walk(x, y, plane_n, seeds[k] - x, sol, seq.signature);
+            }
+            if (!found) continue;
+
+            float cos_x = dot(n_x, sol.chain.dir_in);
+            if (cos_x <= 0.0f) continue;
+            float cos_y = point_light ? 1.0f : dot(n_y, -sol.chain.dir_exit);
+            if (cos_y <= 0.0f) continue;
+
+            // 3. Widoczność obu odcinków poza kryształem
+            HitRecord occ;
+            if (world.hit(Ray(x + n_x * 0.002f, sol.chain.dir_in), 0.001f, sol.chain.t_enter - 0.004f, occ)) continue;
+            const Vec3& p_exit = sol.chain.p[sol.chain.n - 1];
+            if (world.hit(Ray(p_exit + sol.chain.dir_exit * 0.002f, sol.chain.dir_exit), 0.001f, sol.t_exit - 0.006f, occ)) {
+                if (occ.mat->emitted(occ.p).near_zero()) continue;   // zasłonięte przez coś innego niż samo źródło
+            }
+
+            // 4. Wkład: Le * T * G / p_A(y) / π
+            float G = sol.GeometryTerm(cos_x, cos_y);
+            float scale = sol.chain.transmittance * G * light_weight / 3.14159265f;
+            result = result + Le * spec_color * scale;
+        }
+    }
+    return result;
+}
+
+// Path tracer z bezpośrednim próbkowaniem światła (NEE) i kaustyką przez rozmaitość zwierciadlaną (MNEE).
+// Podział transportu światła bez podwójnego liczenia:
+//   - światło bezpośrednie na powierzchniach dyfuzyjnych          -> NEE,
+//   - dyfuzja -> [kryształ: załamanie, k x TIR, załamanie] -> źródło -> MNEE (EstimateManifoldCaustic),
+//   - pozostałe łańcuchy zwierciadlane (lustra, szklane kule, odbicia Fresnela) -> zwykłe trafienie emitera.
+Vec3 ray_color_manifold(const Ray& r, const HittableList& world, const std::vector<Sphere>& light_sources,
+                        const ManifoldCausticContext* mctx, int depth, std::mt19937& rng) {
+    std::uniform_real_distribution<float> dist01(0.0f, 1.0f);
+    Vec3 accumulated_color(0.0f, 0.0f, 0.0f);
+    Vec3 throughput(1.0f, 1.0f, 1.0f);
+    Ray current_ray = r;
+    bool last_was_specular = true;
+    float path_lambda = -1.0f;
+
+    // Stan łańcucha zwierciadlanego od ostatniego wierzchołka dyfuzyjnego, w którym wykonano MNEE
+    enum { CHAIN_NONE, CHAIN_START, CHAIN_INSIDE, CHAIN_EXITED };
+    int chain_state = CHAIN_NONE;
+    int chain_tir = 0;
+
+    for (int bounce = 0; bounce < depth; ++bounce) {
+        HitRecord rec;
+        if (!world.hit(current_ray, 0.001f, 1e9f, rec)) {
+            Vec3 unit_direction = unit_vector(current_ray.direction);
+            float a = 0.5f * (unit_direction.y + 1.0f);
+            Vec3 sky = (1.0f - a) * Vec3(0.04f, 0.05f, 0.08f) + a * Vec3(0.12f, 0.16f, 0.25f);
+            accumulated_color = accumulated_color + throughput * sky;
+            break;
+        }
+
+        Vec3 emitted = rec.mat->emitted(rec.p);
+        if (!emitted.near_zero()) {
+            // Ścieżka klasy MNEE została już policzona w wierzchołku dyfuzyjnym
+            if (last_was_specular && chain_state != CHAIN_EXITED) {
+                accumulated_color = accumulated_color + throughput * emitted;
+            }
+            break;
+        }
+
+        if (rec.mat->is_dielectric()) {
+            auto diel = static_cast<const Dielectric*>(rec.mat.get());
+            float effective_ir = diel->ir;
+            if (diel->dispersion > 1e-4f) {
+                if (path_lambda < 0.0f) {
+                    path_lambda = dist01(rng);
+                    float wr = std::exp(-((path_lambda - 0.15f) * (path_lambda - 0.15f)) / 0.14f);
+                    float wg = std::exp(-((path_lambda - 0.50f) * (path_lambda - 0.50f)) / 0.14f);
+                    float wb = std::exp(-((path_lambda - 0.85f) * (path_lambda - 0.85f)) / 0.14f);
+                    Vec3 spec(wr, wg, wb);
+                    float avg = (spec.x + spec.y + spec.z) / 3.0f;
+                    if (avg > 1e-4f) spec = spec / avg;
+                    float blend = std::clamp(diel->dispersion * 10.0f, 0.0f, 1.0f);
+                    throughput = throughput * ((1.0f - blend) * Vec3(1.0f, 1.0f, 1.0f) + blend * spec);
+                }
+                effective_ir = diel->ir + (2.0f * path_lambda - 1.0f) * diel->dispersion;
+            }
+
+            float ref_ratio = rec.front_face ? (1.0f / effective_ir) : effective_ir;
+            Vec3 unit_dir = unit_vector(current_ray.direction);
+            float cos_theta = std::fmin(dot(-unit_dir, rec.normal), 1.0f);
+            float sin_theta = std::sqrt(std::max(0.0f, 1.0f - cos_theta * cos_theta));
+            bool cannot_refract = ref_ratio * sin_theta > 1.0f;
+            bool reflected = cannot_refract || schlick_reflectance(cos_theta, ref_ratio) > dist01(rng);
+            Vec3 next_dir = reflected ? reflect(unit_dir, rec.normal) : refract(unit_dir, rec.normal, ref_ratio);
+
+            // Klasyfikacja łańcucha: załamanie na wejściu, odbicia TIR, załamanie na wyjściu
+            bool is_crystal = (mctx && rec.mat.get() == mctx->crystal_material);
+            if (!is_crystal) {
+                chain_state = CHAIN_NONE;
+            } else if (chain_state == CHAIN_START && rec.front_face && !reflected) {
+                chain_state = CHAIN_INSIDE;
+                chain_tir = 0;
+            } else if (chain_state == CHAIN_INSIDE && !rec.front_face) {
+                if (cannot_refract) {
+                    if (++chain_tir > MANIFOLD_MAX_TIR) chain_state = CHAIN_NONE;
+                } else {
+                    chain_state = reflected ? CHAIN_NONE : CHAIN_EXITED;
+                }
+            } else {
+                chain_state = CHAIN_NONE;
+            }
+
+            current_ray = Ray(rec.p, unit_vector(next_dir));
+            last_was_specular = true;
+        }
+        else if (rec.mat->is_specular()) {
+            Ray scattered;
+            Vec3 attenuation;
+            if (!rec.mat->scatter(current_ray, rec, attenuation, scattered, rng)) break;
+            throughput = throughput * attenuation;
+            current_ray = scattered;
+            last_was_specular = true;
+            chain_state = CHAIN_NONE;
+        }
+        else {
+            Ray scattered;
+            Vec3 albedo;
+            if (!rec.mat->scatter(current_ray, rec, albedo, scattered, rng)) break;
+
+            // A. Światło bezpośrednie (NEE) ze wszystkich źródeł
+            for (const auto& light : light_sources) {
+                Vec3 light_norm = random_unit_vector(rng);
+                Vec3 light_pt = light.center + light.radius * light_norm;
+                Vec3 to_light = light_pt - rec.p;
+                float dist = to_light.length();
+                if (dist < 1e-4f) continue;
+                Vec3 dir_light = to_light / dist;
+                float cos_theta = dot(rec.normal, dir_light);
+                float cos_light = dot(light_norm, -dir_light);
+                if (cos_theta <= 0.0f || cos_light <= 0.0f) continue;
+
+                HitRecord shadow_rec;
+                if (world.hit(Ray(rec.p + rec.normal * 0.002f, dir_light), 0.001f, dist - 0.005f, shadow_rec)) continue;
+
+                // Le * (albedo / π) * G / p_A, gdzie p_A = 1 / (4πR²)
+                float G = (cos_theta * cos_light) / (dist * dist);
+                Vec3 direct = light.mat->emitted(light_pt) * albedo * (G * 4.0f * light.radius * light.radius);
+                accumulated_color = accumulated_color + throughput * direct;
+            }
+
+            // B. Kaustyka przez kryształ (MNEE) w wierzchołkach widzianych bezpośrednio lub przez powierzchnie zwierciadlane;
+            //    w pozostałych wierzchołkach te same ścieżki liczy zwykłe trafienie emitera (chain_state == CHAIN_NONE)
+            if (mctx && (bounce == 0 || last_was_specular) && !light_sources.empty()) {
+                Vec3 caustic = EstimateManifoldCaustic(*mctx, world, light_sources, rec.p, rec.normal, rng);
+                accumulated_color = accumulated_color + throughput * albedo * caustic;
+                chain_state = CHAIN_START;
+            } else {
+                chain_state = CHAIN_NONE;
+            }
+
+            throughput = throughput * albedo;
+            current_ray = scattered;
+            last_was_specular = false;
+        }
+
+        if (bounce > 3) {
+            float p = std::fmax(throughput.x, std::fmax(throughput.y, throughput.z));
+            p = std::clamp(p, 0.05f, 0.95f);
+            if (dist01(rng) > p) break;
+            throughput = throughput / p;
+        }
+    }
+
+    return accumulated_color;
 }
 
 // ============================================================================
@@ -1407,6 +2056,12 @@ constexpr int IDC_BTN_LIGHT_RESET      = 1051;
 constexpr int IDC_BTN_LIGHT_APPLY      = 1052;
 constexpr int IDC_CHK_CUDA_CAUSTICS    = 1053;
 constexpr int IDC_CHK_CAUSTICS_HQ      = 1054;
+constexpr int IDC_EDIT_CAUSTIC_BLUR    = 1060;
+constexpr int IDC_EDIT_CAUSTIC_LIGHT   = 1061;
+constexpr int IDC_EDIT_CAUSTIC_GAIN    = 1062;
+constexpr int IDC_EDIT_CAUSTIC_RADIUS  = 1063;
+constexpr int IDC_COMBO_CAUSTIC_GRID   = 1064;
+constexpr int IDC_BTN_CAUSTIC_APPLY    = 1065;
 
 std::atomic<bool> g_cuda_caustics{true};
 std::atomic<bool> g_cuda_caustics_hq{true};
@@ -1446,7 +2101,7 @@ inline Vec3 ApplyExposureAndToneMap(Vec3 rad, float exposure_ev, int tonemap_typ
         }
         case TONEMAP_REINHARD: {
             // Rozszerzony Reinhard z kompresją bieli
-            constexpr float white_sq = 16.0f;
+            static constexpr float white_sq = 16.0f;
             auto reinhard = [](float c) {
                 return std::clamp((c * (1.0f + c / white_sq)) / (1.0f + c), 0.0f, 1.0f);
             };
@@ -1608,6 +2263,8 @@ Vec3     g_grab_initial_pos;
 float    g_scale_initial_r     = 1.0f;
 POINT    g_grab_start_mouse    = {0, 0};
 POINT    g_nav_last_mouse      = {0, 0};
+bool     g_grab_by_drag        = false;  // Przesuwanie obiektu przeciąganiem ŚPM (zatwierdzane puszczeniem przycisku)
+float    g_pan_depth           = 4.6f;   // Głębokość (wzdłuż osi widoku) punktu złapanego kursorem przy przesuwaniu widoku
 Vec3     g_grab_plane_hit0;
 Vec3     g_grab_plane_normal;
 Vec3     g_grab_plane_point;
@@ -1627,6 +2284,12 @@ HWND g_hLblAlgo      = nullptr;
 HWND g_hComboAlgo    = nullptr;
 HWND g_hLblPhotons   = nullptr;
 HWND g_hEditPhotons  = nullptr;
+HWND g_hLblCausticBlur = nullptr, g_hEditCausticBlur = nullptr;
+HWND g_hLblCausticLight = nullptr, g_hEditCausticLight = nullptr;
+HWND g_hLblCausticGain = nullptr, g_hEditCausticGain = nullptr;
+HWND g_hLblCausticGrid = nullptr, g_hComboCausticGrid = nullptr;
+HWND g_hLblCausticRadius = nullptr, g_hEditCausticRadius = nullptr;
+HWND g_hBtnCausticApply = nullptr;
 HWND g_hLblPhotHint  = nullptr;
 HWND g_hLblRes       = nullptr;
 HWND g_hComboRes     = nullptr;
@@ -1738,6 +2401,7 @@ HWND g_hGroupSave    = nullptr;
 HWND g_hLblFile      = nullptr;
 HWND g_hEditFilename = nullptr;
 HWND g_hBtnSave      = nullptr;
+HWND g_hLblSaveStatus = nullptr;  // komunikat o wyniku zapisu PNG obok przycisku
 HWND g_hProgressBar  = nullptr;
 HWND g_hStatusLabel  = nullptr;
 
@@ -1804,6 +2468,25 @@ int RayPickObject(int mx, int my) {
         }
     }
     return best_idx;
+}
+
+// Głębokość sceny pod kursorem mierzona wzdłuż osi widoku kamery (promień kamery ma składową osiową = 1, więc t = głębokość).
+// Gdy kursor nie trafia w geometrię, zwracana jest odległość kamery od punktu orbitowania.
+float RayPickDepth(int mx, int my) {
+    if (mx < 0 || mx >= g_canvas_view_width || my < 0 || my >= g_canvas_view_height) return g_cam_distance;
+    Camera cam = GetCurrentCamera();
+    float u = (static_cast<float>(mx) + 0.5f) / static_cast<float>(g_canvas_view_width);
+    float v = (static_cast<float>(g_canvas_view_height - 1 - my) + 0.5f) / static_cast<float>(g_canvas_view_height);
+    Ray r = cam.get_ray(u, v);
+
+    float closest_t = 1e9f;
+    for (int i = 0; i < static_cast<int>(g_scene_objects.size()); ++i) {
+        auto h = CreateHittableFromObject(g_scene_objects[i]);
+        HitRecord rec;
+        if (h->hit(r, 0.001f, closest_t, rec)) closest_t = rec.t;
+    }
+    if (closest_t > 1e8f) return g_cam_distance;
+    return std::clamp(closest_t, 0.05f, 200.0f);
 }
 
 class ViewportThreadPool {
@@ -2140,7 +2823,11 @@ void RenderLiveViewportFrame(bool is_interactive) {
     render_opts.tonemap_mode = g_tonemap_mode.load();
     render_opts.clamp_indirect = 12.0f;
     render_opts.enable_caustics = g_cuda_caustics.load() ? 1 : 0;
-    render_opts.caustic_hq = 0; // W viewporcie zawsze szybki podgląd 1024x1024
+    render_opts.caustic_hq = 0;
+    render_opts.caustic_grid_res = g_caustic_grid_res.load();
+    render_opts.caustic_blur_cm = g_caustic_blur_cm.load();
+    render_opts.caustic_light_size = g_caustic_light_size.load();
+    render_opts.caustic_gain = g_caustic_gain.load();
     render_opts.caustic_photons = (g_photon_count > 50000) ? g_photon_count : 262144;
     render_opts.scene_mode = g_current_scene;
 
@@ -2619,9 +3306,9 @@ void SwitchScene(int scene_id) {
     if (g_hCanvas) InvalidateRect(g_hCanvas, NULL, FALSE);
 }
 
-void StartGrabMode() {
+void StartGrabMode(int start_mx = -1, int start_my = -1) {
     if (g_selected_object_idx < 0 || g_selected_object_idx >= static_cast<int>(g_scene_objects.size())) {
-        SetWindowTextW(g_hStatusLabel, L"Najpierw kliknij obiekt lewym przyciskiem myszy (LPM), aby go wybrać!");
+        SetWindowTextW(g_hStatusLabel, L"Najpierw kliknij obiekt środkowym przyciskiem myszy (ŚPM), aby go wybrać!");
         return;
     }
     if (g_is_rendering.load()) {
@@ -2641,6 +3328,7 @@ void StartGrabMode() {
     POINT pt;
     GetCursorPos(&pt);
     ScreenToClient(g_hCanvas, &pt);
+    if (start_mx >= 0 && start_my >= 0) pt = {start_mx, start_my};
     g_grab_start_mouse = pt;
 
     float u0 = (static_cast<float>(pt.x) + 0.5f) / static_cast<float>(g_canvas_view_width);
@@ -2970,7 +3658,7 @@ void StartRendering() {
     if (g_render_algo == 1) algoName = L"Standardowy PT (GPU / CUDA)";
     else if (g_render_algo == 2) algoName = L"BDPT + globalna mapa fotonów";
     else if (g_render_algo == 3) algoName = L"Metropolis Light Transport (MLT)";
-    else if (g_render_algo == 4) algoName = L"Manifold Exploration (MEMLT / MEPT)";
+    else if (g_render_algo == 4) algoName = L"PT + Manifold NEE (kaustyka przez rozmaitość)";
 
     wchar_t statusInit[160];
     if (g_render_algo == 1) {
@@ -2980,7 +3668,7 @@ void StartRendering() {
                  spp, g_cuda_device_name.empty() ? L"NVIDIA GPU" : std::wstring(g_cuda_device_name.begin(), g_cuda_device_name.end()).c_str());
         SendMessage(g_hProgressBar, PBM_SETRANGE, 0, MAKELPARAM(0, spp));
         SendMessage(g_hProgressBar, PBM_SETPOS, 0, 0);
-    } else if (g_render_algo == 3 || g_render_algo == 4) {
+    } else if (g_render_algo == 3) {
         size_t total_mutations = static_cast<size_t>(g_render_width) * g_render_height * spp;
         const wchar_t* tag = (g_render_algo == 4) ? L"MEMLT" : L"MLT";
         swprintf(statusInit, 160, L"Rozpoczynanie [%s]: %zu mutacji (%d/px, %d fotonów)...",
@@ -3035,10 +3723,29 @@ void StartRendering() {
         // Dokładna kamera dla wybranej rozdzielczości renderowania
         Camera cam = GetCameraForRender(g_render_width, g_render_height);
 
+        // Tryb 4: kaustyka liczona przez rozmaitość zwierciadlaną (MNEE) zamiast mapy fotonów
+        ManifoldCausticContext manifold_ctx;
+        const ManifoldCausticContext* manifold_ptr = nullptr;
+        if (algo == 4 && glass_crystal && glass_crystal->mat && glass_crystal->mat->is_dielectric() && !light_sources.empty()) {
+            auto diel = static_cast<const Dielectric*>(glass_crystal->mat.get());
+            manifold_ctx.crystal = glass_crystal.get();
+            manifold_ctx.crystal_material = glass_crystal->mat.get();
+            manifold_ctx.base_ior = diel->ir;
+            manifold_ctx.dispersion = diel->dispersion;
+            manifold_ctx.light_size = g_caustic_light_size.load();
+            for (const auto& light : light_sources) {
+                manifold_ctx.light_sequences.push_back(BuildManifoldSequences(manifold_ctx, light));
+            }
+            int seq_total = 0;
+            for (const auto& ls : manifold_ctx.light_sequences) seq_total += static_cast<int>(ls.size());
+            g_manifold_sequences.store(seq_total);
+            manifold_ptr = &manifold_ctx;
+        }
+
         PhotonMap photon_map;
-        if ((algo == 2 || algo == 3 || algo == 4) && glass_crystal && !light_sources.empty()) {
-            // Fine spatial cell size 0.020f dla ostrej, szczegółowej kaustyki fasetkowej
-            photon_map.init(0.020f, -6.0f, 6.0f, -6.0f, 6.0f);
+        if ((algo == 2 || algo == 3) && glass_crystal && !light_sources.empty()) {
+            // Rozmiar komórki siatki dopasowany do promienia filtru kaustyki (domyślnie 0.020f przy promieniu 0.028f)
+            photon_map.init(std::clamp(g_caustic_cpu_radius.load() * 0.714f, 0.010f, 0.060f), -6.0f, 6.0f, -6.0f, 6.0f);
 
             const auto& light = light_sources[0];
             Vec3 crystal_center = glass_crystal->center;
@@ -3215,6 +3922,10 @@ void StartRendering() {
             render_opts.clamp_indirect = 12.0f; // Cycles firefly suppression
             render_opts.enable_caustics = g_cuda_caustics.load() ? 1 : 0;
             render_opts.caustic_hq = g_cuda_caustics_hq.load() ? 1 : 0;
+            render_opts.caustic_grid_res = g_caustic_grid_res.load();
+            render_opts.caustic_blur_cm = g_caustic_blur_cm.load();
+            render_opts.caustic_light_size = g_caustic_light_size.load();
+            render_opts.caustic_gain = g_caustic_gain.load();
             render_opts.caustic_photons = (g_photon_count > 50000) ? g_photon_count : (render_opts.caustic_hq ? 1048576 : 524288);
             render_opts.scene_mode = g_current_scene;
 
@@ -3244,7 +3955,7 @@ void StartRendering() {
                 }
             }
         }
-        else if (algo == 3 || algo == 4) {
+        else if (algo == 3) {
             // ================================================================
             // MCMC: MLT (Cline & Egbert 2005) / MEMLT (Jakob & Marschner 2012)
             // ================================================================
@@ -3365,58 +4076,7 @@ void StartRendering() {
                             // Nowa ścieżka (Sekcja 3.2 z pracy) - gwarantuje ergodyczność
                             for (size_t k = 0; k < MLT_DIM; ++k) u_prop[k] = dist01(rng);
                         } else {
-                            bool did_manifold = false;
-                            if (algo == 4 && glass_crystal && dist01(rng) < 0.50f) {
-                                // Manifold Exploration Perturbation (Jakob & Marschner 2012, Sekcja 5.1 & Rysunek 5 i 6)
-                                Ray cur_cam_ray = cam.get_ray(cur_x.u[0], 1.0f - cur_x.u[1]);
-                                float path_ior = crystal_ior;
-                                if (crystal_dispersion > 1e-4f) {
-                                    path_ior = crystal_ior + (2.0f * cur_x.u[2] - 1.0f) * crystal_dispersion;
-                                }
-                                auto spec_test = TraceThroughCrystal(cur_cam_ray, glass_crystal, path_ior);
-                                if (spec_test.hit) {
-                                    // Zamiast zakładać stałą podłogę Y=0, sprawdzamy gdzie promień wyjściowy trafia w scenie:
-                                    Ray exit_ray(spec_test.p_exit + spec_test.dir_exit * 0.001f, spec_test.dir_exit);
-                                    HitRecord hit_rec;
-                                    if (world.hit(exit_ray, 0.001f, 1e9f, hit_rec) && !hit_rec.mat->is_specular()) {
-                                        Vec3 hit_p = hit_rec.p;
-                                        Vec3 target_n = hit_rec.normal;
-
-                                        // Dwuskala perturbacji celu: drobna (70%) dla ostrych krawędzi, szersza (30%) dla przeskakiwania fasetek
-                                        float step_scale = (dist01(rng) < 0.70f) ? 0.015f : 0.060f;
-                                        std::normal_distribution<float> norm_dist(0.0f, step_scale);
-                                        Vec3 tangent_u = (std::fabs(target_n.y) > 0.9f) ? Vec3(1.0f, 0.0f, 0.0f) : Vec3(0.0f, 1.0f, 0.0f);
-                                        Vec3 T = unit_vector(cross(target_n, tangent_u));
-                                        Vec3 B = cross(target_n, T);
-                                        Vec3 perturbed_target = hit_p + T * norm_dist(rng) + B * norm_dist(rng);
-
-                                        // Perturbacja spektralna wzdłuż rozmaitości dyspersyjnej:
-                                        float prop_wl = cur_x.u[2];
-                                        float walked_ior = path_ior;
-                                        if (crystal_dispersion > 1e-4f) {
-                                            std::normal_distribution<float> wl_dist(0.0f, 0.035f);
-                                            prop_wl = std::clamp(cur_x.u[2] + wl_dist(rng), 0.0f, 1.0f);
-                                            walked_ior = crystal_ior + (2.0f * prop_wl - 1.0f) * crystal_dispersion;
-                                        }
-
-                                        Vec3 walked_dir = cur_cam_ray.direction;
-                                        Vec3 final_p;
-                                        // 4 iteracje metody Newtona wystarczają dzięki kwadratowej zbieżności
-                                        if (WalkSpecularManifold(cam.origin, walked_dir, glass_crystal, perturbed_target, target_n, final_p, 2e-3f, 4, walked_ior)) {
-                                            float new_s = 0.0f, new_t = 0.0f;
-                                            if (cam.project_direction(walked_dir, new_s, new_t)) {
-                                                u_prop = cur_x.u;
-                                                u_prop[0] = std::clamp(new_s, 0.0f, 0.999999f);
-                                                u_prop[1] = std::clamp(1.0f - new_t, 0.0f, 0.999999f);
-                                                u_prop[2] = prop_wl;
-                                                did_manifold = true;
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-
-                            if (!did_manifold) {
+                            {
                                 u_prop = cur_x.u;
                                 // Perturbacja soczewki kamery (Appendix B)
                                 float px_f = cur_x.u[0] * static_cast<float>(width);
@@ -3570,6 +4230,8 @@ void StartRendering() {
 
                                 if (algo == 2) {
                                     col = ray_color_bdpt(r, world, light_sources, photon_map, max_depth, rng);
+                                } else if (algo == 4) {
+                                    col = ray_color_manifold(r, world, light_sources, manifold_ptr, max_depth, rng);
                                 } else {
                                     col = ray_color_standard(r, world, max_depth, rng);
                                 }
@@ -3642,7 +4304,7 @@ void StopRendering() {
         if (g_render_algo == 1) {
             SetWindowTextW(g_hStatusLabel, L"Zatrzymywanie kernela CUDA...");
         } else if (g_render_algo == 4) {
-            SetWindowTextW(g_hStatusLabel, L"Zatrzymywanie eksploracji rozmaitości (MEMLT)...");
+            SetWindowTextW(g_hStatusLabel, L"Zatrzymywanie renderowania Manifold NEE...");
         } else if (g_render_algo == 3) {
             SetWindowTextW(g_hStatusLabel, L"Zatrzymywanie łańcuchów Markowa (MLT)...");
         } else {
@@ -3692,14 +4354,16 @@ void SaveToPNG() {
     }
 
     if (stbi_write_png(filenameA, g_render_width, g_render_height, 3, pixels.data(), g_render_width * 3) != 0) {
-        wchar_t msg[300];
-        swprintf(msg, 300, L"Zapisano pomyslnie obraz w rozdzielczosci %dx%d px!\nPlik docelowy: %s",
-                 g_render_width, g_render_height, filenameW);
-        MessageBoxW(g_hWnd, msg, L"Sukces zapisu PNG", MB_OK | MB_ICONINFORMATION);
+        // Potwierdzenie bez okna dialogowego: komunikat obok przycisku zapisu oraz w pasku statusu
+        wchar_t msg[MAX_PATH + 80];
+        swprintf(msg, MAX_PATH + 80, L"Zapisano %dx%d: %s", g_render_width, g_render_height, filenameW);
+        if (g_hLblSaveStatus) SetWindowTextW(g_hLblSaveStatus, msg);
+        SetWindowTextW(g_hStatusLabel, msg);
     } else {
-        wchar_t msg[300];
-        swprintf(msg, 300, L"Blad podczas zapisu do pliku:\n%s", filenameW);
-        MessageBoxW(g_hWnd, msg, L"Blad zapisu", MB_OK | MB_ICONERROR);
+        wchar_t msg[MAX_PATH + 80];
+        swprintf(msg, MAX_PATH + 80, L"Błąd zapisu: %s", filenameW);
+        if (g_hLblSaveStatus) SetWindowTextW(g_hLblSaveStatus, msg);
+        SetWindowTextW(g_hStatusLabel, msg);
     }
 }
 
@@ -3709,52 +4373,69 @@ void SaveToPNG() {
 
 LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     switch (msg) {
-        case WM_LBUTTONDOWN: {
-            if (g_has_rendered_image.load()) {
-                g_has_rendered_image.store(false);
-                RenderFastPreview();
-                InvalidateRect(hWnd, NULL, FALSE);
-            }
-            int mx = LOWORD(lParam);
-            int my = HIWORD(lParam);
+        // Schemat myszy: LPM = obrót kamery, ŚPM = wybór i przesuwanie obiektu, PPM = przesuwanie widoku (pan)
+        case WM_LBUTTONDOWN:
+        case WM_MBUTTONDOWN:
+        case WM_RBUTTONDOWN: {
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
             SetFocus(hWnd);
 
-            if (GetKeyState(VK_MENU) < 0) {
-                if (GetKeyState(VK_SHIFT) < 0) {
-                    g_is_panning = true;
-                } else {
-                    g_is_orbiting = true;
+            // Tryby klawiszowe G / S: LPM zatwierdza, PPM anuluje (jak w Blenderze)
+            if (g_is_grabbing || g_is_scaling) {
+                if (msg == WM_LBUTTONDOWN) {
+                    if (g_is_grabbing) ConfirmGrabMode(); else ConfirmScaleMode();
+                } else if (msg == WM_RBUTTONDOWN) {
+                    if (g_is_grabbing) CancelGrabMode(); else CancelScaleMode();
                 }
-                g_nav_last_mouse = {mx, my};
-                SetCapture(hWnd);
+                if (msg != WM_MBUTTONDOWN) g_grab_by_drag = false;
                 return 0;
             }
+            if (g_is_orbiting || g_is_panning) return 0;
 
-            if (g_is_grabbing) {
-                ConfirmGrabMode();
-            } else if (g_is_scaling) {
-                ConfirmScaleMode();
+            if (g_has_rendered_image.load()) {
+                g_has_rendered_image.store(false);
+                g_viewport_pt_spp = 0;
+                if (g_live_viewport_pt.load() && g_cuda_available) {
+                    RenderLiveViewportFrame(false);
+                } else {
+                    RenderFastPreview();
+                }
+                InvalidateRect(hWnd, NULL, FALSE);
+            }
+
+            if (msg == WM_LBUTTONDOWN) {
+                g_is_orbiting = true;
+                g_nav_last_mouse = {mx, my};
+                SetCapture(hWnd);
+            } else if (msg == WM_RBUTTONDOWN) {
+                g_is_panning = true;
+                g_pan_depth = RayPickDepth(mx, my);
+                g_nav_last_mouse = {mx, my};
+                SetCapture(hWnd);
             } else {
+                // ŚPM: wybór obiektu pod kursorem i natychmiastowe złapanie go do przesuwania (puść przycisk, aby zatwierdzić)
                 int hit_idx = RayPickObject(mx, my);
                 if (hit_idx >= 0) {
                     g_selected_object_idx = hit_idx;
                     SendMessage(g_hComboObjects, CB_SETCURSEL, hit_idx, 0);
                     UpdateObjectFieldsFromSelection(hit_idx);
 
-                    wchar_t status[180];
-                    swprintf(status, 180, L"Wybrano: [%s]. Wciśnij 'G', aby przemieścić, lub 'S', aby skalować.",
-                             g_scene_objects[hit_idx].name.c_str());
-                    SetWindowTextW(g_hStatusLabel, status);
-
-                    RenderFastPreview();
-                    InvalidateRect(hWnd, NULL, FALSE);
+                    StartGrabMode(mx, my);
+                    g_grab_by_drag = g_is_grabbing;
+                    if (!g_is_grabbing) {
+                        RenderFastPreview();
+                        InvalidateRect(hWnd, NULL, FALSE);
+                    }
                 }
             }
             return 0;
         }
 
-        case WM_LBUTTONUP: {
-            if (g_is_orbiting || g_is_panning) {
+        case WM_LBUTTONUP:
+        case WM_RBUTTONUP: {
+            bool was_nav = (msg == WM_LBUTTONUP) ? g_is_orbiting : g_is_panning;
+            if (was_nav) {
                 g_is_orbiting = false;
                 g_is_panning  = false;
                 ReleaseCapture();
@@ -3766,46 +4447,13 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                 }
                 InvalidateRect(hWnd, NULL, FALSE);
             }
-            return 0;
-        }
-
-        case WM_MBUTTONDOWN: {
-            if (g_has_rendered_image.load()) {
-                g_has_rendered_image.store(false);
-                g_viewport_pt_spp = 0;
-                if (g_live_viewport_pt.load() && g_cuda_available) {
-                    RenderLiveViewportFrame(false);
-                } else {
-                    RenderFastPreview();
-                }
-                InvalidateRect(hWnd, NULL, FALSE);
-            }
-            int mx = LOWORD(lParam);
-            int my = HIWORD(lParam);
-            SetFocus(hWnd);
-
-            if (GetKeyState(VK_SHIFT) < 0) {
-                g_is_panning = true;
-            } else {
-                g_is_orbiting = true;
-            }
-            g_nav_last_mouse = {mx, my};
-            SetCapture(hWnd);
             return 0;
         }
 
         case WM_MBUTTONUP: {
-            if (g_is_orbiting || g_is_panning) {
-                g_is_orbiting = false;
-                g_is_panning  = false;
-                ReleaseCapture();
-                g_viewport_pt_spp = 0;
-                if (g_live_viewport_pt.load() && g_cuda_available) {
-                    RenderLiveViewportFrame(false);
-                } else {
-                    RenderFastPreview();
-                }
-                InvalidateRect(hWnd, NULL, FALSE);
+            if (g_grab_by_drag) {
+                g_grab_by_drag = false;
+                if (g_is_grabbing) ConfirmGrabMode();
             }
             return 0;
         }
@@ -3827,23 +4475,17 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
             return 0;
         }
 
-        case WM_RBUTTONDOWN: {
-            if (g_is_grabbing) {
-                CancelGrabMode();
-            } else if (g_is_scaling) {
-                CancelScaleMode();
-            }
-            return 0;
-        }
-
         case WM_MOUSEMOVE: {
-            int mx = LOWORD(lParam);
-            int my = HIWORD(lParam);
+            // Rzutowanie na short: przy przechwyconej myszy współrzędne poza kanwą są ujemne
+            int mx = static_cast<short>(LOWORD(lParam));
+            int my = static_cast<short>(HIWORD(lParam));
 
             if (g_is_orbiting) {
                 int dx = mx - g_nav_last_mouse.x;
                 int dy = my - g_nav_last_mouse.y;
-                g_cam_yaw   += dx * 0.007f;
+                // Orbita typu turntable (Blender / CAD): scena podąża za kursorem.
+                // Ruch myszy w prawo obraca scenę w prawo (kamera okrąża cel w lewo), ruch w dół pokazuje scenę bardziej z góry.
+                g_cam_yaw   -= dx * 0.007f;
                 g_cam_pitch = std::clamp(g_cam_pitch + dy * 0.007f, -1.45f, 1.45f);
                 g_nav_last_mouse = {mx, my};
                 g_viewport_dirty.store(true);
@@ -3858,7 +4500,11 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                 Vec3 w = unit_vector(cam.origin - cam.lookat);
                 Vec3 u = unit_vector(cross(cam.vup, w));
                 Vec3 v = cross(w, u);
-                g_cam_target = g_cam_target - u * (dx * 0.0025f * g_cam_distance) + v * (dy * 0.0025f * g_cam_distance);
+                // Transformacja frustum: rozmiar piksela w przestrzeni świata na głębokości złapanego punktu.
+                // Wysokość frustum na głębokości d wynosi 2*d*tan(fov/2), więc punkt pod kursorem podąża za nim 1:1.
+                float world_per_px = 2.0f * g_pan_depth * std::tan(g_cam_fov * 3.14159265f / 360.0f)
+                                     / static_cast<float>(std::max(1, g_canvas_view_height));
+                g_cam_target = g_cam_target - u * (dx * world_per_px) + v * (dy * world_per_px);
                 g_nav_last_mouse = {mx, my};
                 g_viewport_dirty.store(true);
                 g_viewport_pt_spp = 0;
@@ -4149,7 +4795,7 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
                              g_scene_objects[g_selected_object_idx].name.c_str(), g_scene_objects[g_selected_object_idx].radius);
                     SetTextColor(hdc, RGB(80, 220, 255));
                 } else {
-                    swprintf(hudText, 240, L" 🎮 [BLENDER 3D] LPM: wybór | G: przesuń | S: skaluj | SPM / Alt+LPM: obrót | Scroll: zoom | Shift+SPM: przesuwanie widoku | F: siatka",
+                    swprintf(hudText, 240, L" 🎮 [BLENDER 3D] LPM: obrót | SPM: wybór i przesuwanie obiektu | PPM: przesuwanie widoku | Scroll: zoom | G: przesuń | S: skaluj | F: siatka",
                              (g_selected_object_idx >= 0 ? g_scene_objects[g_selected_object_idx].name.c_str() : L"brak"));
                     SetTextColor(hdc, RGB(210, 225, 245));
                 }
@@ -4183,6 +4829,80 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
 // ============================================================================
 
 
+void ResizeLayout(int clientW, int clientH) {
+    const int panelW = 390;
+
+    // Kanwa widoku 3D wypełnia całą przestrzeń na lewo od panelu sterowania
+    g_canvas_view_width  = std::max(320, clientW - panelW - 50);
+    g_canvas_view_height = std::max(180, clientH - 100);
+    if (g_hCanvas) MoveWindow(g_hCanvas, 15, 15, g_canvas_view_width, g_canvas_view_height, TRUE);
+
+    // Pasek narzędzi pod kanwą, pasek postępu i etykieta statusu
+    int rowY = 15 + g_canvas_view_height + 5;
+    if (g_hChkLiveViewportPT) MoveWindow(g_hChkLiveViewportPT, 15, rowY, 260, 22, TRUE);
+    if (g_hLblLightPower) MoveWindow(g_hLblLightPower, 280, rowY + 2, 75, 18, TRUE);
+    if (g_hEditLightPower) MoveWindow(g_hEditLightPower, 360, rowY, 50, 22, TRUE);
+    if (g_hBtnLightDown) MoveWindow(g_hBtnLightDown, 415, rowY, 28, 22, TRUE);
+    if (g_hBtnLightUp) MoveWindow(g_hBtnLightUp, 447, rowY, 28, 22, TRUE);
+    if (g_hBtnLightHalf) MoveWindow(g_hBtnLightHalf, 480, rowY, 42, 22, TRUE);
+    if (g_hBtnLightDouble) MoveWindow(g_hBtnLightDouble, 526, rowY, 42, 22, TRUE);
+    if (g_hBtnLightReset) MoveWindow(g_hBtnLightReset, 572, rowY, 42, 22, TRUE);
+    if (g_hLblVpSpp) MoveWindow(g_hLblVpSpp, 620, rowY + 2, 160, 18, TRUE);
+    if (g_hProgressBar) MoveWindow(g_hProgressBar, 15, rowY + 26, g_canvas_view_width, 20, TRUE);
+    if (g_hStatusLabel) MoveWindow(g_hStatusLabel, 15, rowY + 50, g_canvas_view_width + panelW, 24, TRUE);
+
+    // Prawy panel sterowania zadokowany przy prawej krawędzi
+    int sideX = 15 + g_canvas_view_width + 20;
+    int curY = 15;
+
+    // 1. Grupa: Scena 3D - import geometrii
+    if (g_hGroupScene) MoveWindow(g_hGroupScene, sideX, curY, panelW, 82, TRUE);
+    curY += 20;
+    if (g_hLblScene) MoveWindow(g_hLblScene, sideX + 15, curY, 80, 20, TRUE);
+    if (g_hComboScene) MoveWindow(g_hComboScene, sideX + 100, curY - 2, 275, 150, TRUE);
+
+    curY += 26;
+    if (g_hBtnImportObj) MoveWindow(g_hBtnImportObj, sideX + 15, curY, 175, 28, TRUE);
+    if (g_hBtnExportObj) MoveWindow(g_hBtnExportObj, sideX + 200, curY, 175, 28, TRUE);
+
+    curY += 44;
+    // 2. Grupa: Parametry renderowania & Algorytm
+    if (g_hGroupRender) MoveWindow(g_hGroupRender, sideX, curY, panelW, 330, TRUE);
+    curY += 20;
+    if (g_hLblAlgo) MoveWindow(g_hLblAlgo, sideX + 15, curY, 95, 20, TRUE);
+    if (g_hComboAlgo) MoveWindow(g_hComboAlgo, sideX + 115, curY - 2, 260, 150, TRUE);
+
+    curY += 26;
+    if (g_hChkCudaCaustics) MoveWindow(g_hChkCudaCaustics, sideX + 15, curY, 175, 22, TRUE);
+    if (g_hChkCausticsHQ) MoveWindow(g_hChkCausticsHQ, sideX + 195, curY, 180, 22, TRUE);
+
+    curY += 26;
+    if (g_hLblPhotons) MoveWindow(g_hLblPhotons, sideX + 15, curY, 100, 20, TRUE);
+    if (g_hEditPhotons) MoveWindow(g_hEditPhotons, sideX + 115, curY - 2, 85, 22, TRUE);
+    if (g_hLblPhotHint) MoveWindow(g_hLblPhotHint, sideX + 210, curY, 165, 20, TRUE);
+
+    curY += 26;
+    if (g_hLblCausticBlur) MoveWindow(g_hLblCausticBlur, sideX + 15, curY, 82, 20, TRUE);
+    if (g_hEditCausticBlur) MoveWindow(g_hEditCausticBlur, sideX + 100, curY - 2, 45, 22, TRUE);
+    if (g_hLblCausticLight) MoveWindow(g_hLblCausticLight, sideX + 153, curY, 42, 20, TRUE);
+    if (g_hEditCausticLight) MoveWindow(g_hEditCausticLight, sideX + 197, curY - 2, 45, 22, TRUE);
+    if (g_hLblCausticGain) MoveWindow(g_hLblCausticGain, sideX + 252, curY, 48, 20, TRUE);
+    if (g_hEditCausticGain) MoveWindow(g_hEditCausticGain, sideX + 302, curY - 2, 45, 22, TRUE);
+
+    curY += 26;
+    if (g_hLblCausticGrid) MoveWindow(g_hLblCausticGrid, sideX + 15, curY, 65, 20, TRUE);
+    if (g_hComboCausticGrid) MoveWindow(g_hComboCausticGrid, sideX + 82, curY - 2, 88, 150, TRUE);
+    if (g_hLblCausticRadius) MoveWindow(g_hLblCausticRadius, sideX + 178, curY, 72, 20, TRUE);
+    if (g_hEditCausticRadius) MoveWindow(g_hEditCausticRadius, sideX + 252, curY - 2, 50, 22, TRUE);
+    if (g_hBtnCausticApply) MoveWindow(g_hBtnCausticApply, sideX + 310, curY - 2, 65, 24, TRUE);
+
+    curY += 26;
+    if (g_hLblRes) MoveWindow(g_hLblRes, sideX + 15, curY, 95, 20, TRUE);
+    if (g_hComboRes) MoveWindow(g_hComboRes, sideX + 115, curY - 2, 260, 200, TRUE);
+
+    curY += 26;
+    if (g_hLblW) MoveWindow(g_hLblW, sideX + 15, curY, 80, 20, TRUE);
+    if (g_hEditResW) MoveWindow(g_hEditResW, sideX + 100, curY - 2, 65, 22, TRUE);
     if (g_hLblH) MoveWindow(g_hLblH, sideX + 190, curY, 75, 20, TRUE);
     if (g_hEditResH) MoveWindow(g_hEditResH, sideX + 270, curY - 2, 65, 22, TRUE);
 
@@ -4274,7 +4994,8 @@ LRESULT CALLBACK CanvasWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam
     if (g_hEditFilename) MoveWindow(g_hEditFilename, sideX + 100, curY - 2, 275, 22, TRUE);
 
     curY += 24;
-    if (g_hBtnSave) MoveWindow(g_hBtnSave, sideX + 15, curY, 360, 26, TRUE);
+    if (g_hBtnSave) MoveWindow(g_hBtnSave, sideX + 15, curY, 150, 26, TRUE);
+    if (g_hLblSaveStatus) MoveWindow(g_hLblSaveStatus, sideX + 172, curY + 5, 205, 18, TRUE);
 
     // Renderujemy szybki podgląd tylko jeśli renderowanie PT nie trwa w tle i nie ma wyrenderowanego obrazu!
     if (!g_is_rendering.load() && !g_has_rendered_image.load()) {
@@ -4338,7 +5059,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             // 2. Grupa: Parametry renderowania & Algorytm
             g_hGroupRender = CreateWindowW(L"BUTTON", L" Parametry renderowania i algorytm ",
                 WS_CHILD | WS_VISIBLE | BS_GROUPBOX,
-                sideX, curY, 390, 278, hWnd, nullptr, nullptr, nullptr);
+                sideX, curY, 390, 330, hWnd, nullptr, nullptr, nullptr);
             SendMessage(g_hGroupRender, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             curY += 20;
@@ -4352,7 +5073,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             SendMessage(g_hComboAlgo, CB_ADDSTRING, 0, (LPARAM)L"Standardowy Path Tracing (GPU / CUDA)");
             SendMessage(g_hComboAlgo, CB_ADDSTRING, 0, (LPARAM)L"BDPT (globalna mapa fotonów – kryształ)");
             SendMessage(g_hComboAlgo, CB_ADDSTRING, 0, (LPARAM)L"Metropolis Light Transport (MLT)");
-            SendMessage(g_hComboAlgo, CB_ADDSTRING, 0, (LPARAM)L"Manifold Exploration (MEMLT – rozmaitości)");
+            SendMessage(g_hComboAlgo, CB_ADDSTRING, 0, (LPARAM)L"Manifold NEE (MNEE – kaustyka przez rozmaitość)");
 
             if (CudaPT_IsAvailable(g_cuda_device_name)) {
                 g_cuda_available = true;
@@ -4385,6 +5106,39 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 
             g_hLblPhotHint = CreateWindowW(L"STATIC", L"(np. 20 000 – 150 000)", WS_CHILD | WS_VISIBLE, sideX + 210, curY, 165, 20, hWnd, nullptr, nullptr, nullptr);
             SendMessage(g_hLblPhotHint, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            // Parametry ostrości kaustyki: rozmycie, rozmiar źródła, jasność, siatka GPU, promień CPU
+            curY += 26;
+            g_hLblCausticBlur = CreateWindowW(L"STATIC", L"Rozmycie [cm]:", WS_CHILD | WS_VISIBLE, sideX + 15, curY, 82, 20, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblCausticBlur, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hEditCausticBlur = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.25", WS_CHILD | WS_VISIBLE, sideX + 100, curY - 2, 45, 22, hWnd, (HMENU)IDC_EDIT_CAUSTIC_BLUR, nullptr, nullptr);
+            SendMessage(g_hEditCausticBlur, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hLblCausticLight = CreateWindowW(L"STATIC", L"Źródło:", WS_CHILD | WS_VISIBLE, sideX + 153, curY, 42, 20, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblCausticLight, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hEditCausticLight = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.12", WS_CHILD | WS_VISIBLE, sideX + 197, curY - 2, 45, 22, hWnd, (HMENU)IDC_EDIT_CAUSTIC_LIGHT, nullptr, nullptr);
+            SendMessage(g_hEditCausticLight, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hLblCausticGain = CreateWindowW(L"STATIC", L"Jasność:", WS_CHILD | WS_VISIBLE, sideX + 252, curY, 48, 20, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblCausticGain, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hEditCausticGain = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"1.00", WS_CHILD | WS_VISIBLE, sideX + 302, curY - 2, 45, 22, hWnd, (HMENU)IDC_EDIT_CAUSTIC_GAIN, nullptr, nullptr);
+            SendMessage(g_hEditCausticGain, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            curY += 26;
+            g_hLblCausticGrid = CreateWindowW(L"STATIC", L"Siatka GPU:", WS_CHILD | WS_VISIBLE, sideX + 15, curY, 65, 20, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblCausticGrid, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hComboCausticGrid = CreateWindowW(L"COMBOBOX", nullptr, WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST,
+                sideX + 82, curY - 2, 88, 150, hWnd, (HMENU)IDC_COMBO_CAUSTIC_GRID, nullptr, nullptr);
+            SendMessage(g_hComboCausticGrid, WM_SETFONT, (WPARAM)hFont, TRUE);
+            SendMessage(g_hComboCausticGrid, CB_ADDSTRING, 0, (LPARAM)L"1024 (szybka)");
+            SendMessage(g_hComboCausticGrid, CB_ADDSTRING, 0, (LPARAM)L"2048 (ostra)");
+            SendMessage(g_hComboCausticGrid, CB_ADDSTRING, 0, (LPARAM)L"4096 (b. ostra)");
+            SendMessage(g_hComboCausticGrid, CB_SETCURSEL, 1, 0);
+            g_hLblCausticRadius = CreateWindowW(L"STATIC", L"Promień CPU:", WS_CHILD | WS_VISIBLE, sideX + 178, curY, 72, 20, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblCausticRadius, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hEditCausticRadius = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"0.028", WS_CHILD | WS_VISIBLE, sideX + 252, curY - 2, 50, 22, hWnd, (HMENU)IDC_EDIT_CAUSTIC_RADIUS, nullptr, nullptr);
+            SendMessage(g_hEditCausticRadius, WM_SETFONT, (WPARAM)hFont, TRUE);
+            g_hBtnCausticApply = CreateWindowW(L"BUTTON", L"Zastosuj", WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+                sideX + 310, curY - 2, 65, 24, hWnd, (HMENU)IDC_BTN_CAUSTIC_APPLY, nullptr, nullptr);
+            SendMessage(g_hBtnCausticApply, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             curY += 26;
             g_hLblRes = CreateWindowW(L"STATIC", L"Rozdzielczość:", WS_CHILD | WS_VISIBLE, sideX + 15, curY, 95, 20, hWnd, nullptr, nullptr, nullptr);
@@ -4620,8 +5374,12 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             curY += 24;
             g_hBtnSave = CreateWindowW(L"BUTTON", L"💾 Zapisz obraz PNG",
                 WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
-                sideX + 15, curY, 360, 26, hWnd, (HMENU)IDC_BTN_SAVE_PNG, nullptr, nullptr);
+                sideX + 15, curY, 150, 26, hWnd, (HMENU)IDC_BTN_SAVE_PNG, nullptr, nullptr);
             SendMessage(g_hBtnSave, WM_SETFONT, (WPARAM)hFont, TRUE);
+
+            g_hLblSaveStatus = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE | SS_ENDELLIPSIS,
+                sideX + 172, curY + 5, 205, 18, hWnd, nullptr, nullptr, nullptr);
+            SendMessage(g_hLblSaveStatus, WM_SETFONT, (WPARAM)hFont, TRUE);
 
             // Pasek narzędzi podglądu na żywo i mocy świateł
             g_hChkLiveViewportPT = CreateWindowW(L"BUTTON", L"⚡ Podgląd Path Tracing (GPU RTX) [Z]",
@@ -4666,7 +5424,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                 WS_CHILD | WS_VISIBLE | PBS_SMOOTH,
                 15, 496, g_canvas_view_width, 20, hWnd, (HMENU)IDC_PROGRESS_BAR, nullptr, nullptr);
 
-            g_hStatusLabel = CreateWindowW(L"STATIC", L"Gotowy. Pełna kontrola 3D: LPM = wybór, G = przesuń, S = skaluj, SPM / Alt+LPM = obrót, Scroll = zoom.",
+            g_hStatusLabel = CreateWindowW(L"STATIC", L"Gotowy. LPM = obrót kamery, SPM = wybór i przesuwanie obiektu, PPM = przesuwanie widoku, Scroll = zoom, G / S = przesuń / skaluj.",
                 WS_CHILD | WS_VISIBLE,
                 15, 520, g_canvas_view_width + 390, 24, hWnd, (HMENU)IDC_STATUS_LABEL, nullptr, nullptr);
             SendMessage(g_hStatusLabel, WM_SETFONT, (WPARAM)hFont, TRUE);
@@ -4703,7 +5461,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                  g_cuda_device_name.empty() ? L"NVIDIA GPU" : std::wstring(g_cuda_device_name.begin(), g_cuda_device_name.end()).c_str(),
                                  percent, done, total, elapsed.count());
                         SetWindowTextW(g_hStatusLabel, status);
-                    } else if (g_render_algo == 3 || g_render_algo == 4) {
+                    } else if (g_render_algo == 3) {
                         size_t done = g_mlt_mutations_done.load();
                         size_t total = g_mlt_total_mutations.load();
                         int pos = (total > 0) ? static_cast<int>(done * 1000 / total) : 0;
@@ -4741,11 +5499,16 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         SendMessage(g_hProgressBar, PBM_SETPOS, done, 0);
 
                         int percent = (g_total_tiles > 0) ? static_cast<int>(done * 100 / g_total_tiles) : 0;
-                        const wchar_t* modeTag = (g_render_algo == 2) ? L"BDPT + mapa fotonów" : L"PT (CPU)";
+                        const wchar_t* modeTag = (g_render_algo == 2) ? L"BDPT + mapa fotonów" : ((g_render_algo == 4) ? L"PT + Manifold NEE" : L"PT (CPU)");
 
                         wchar_t status[180];
-                        swprintf(status, 180, L"Renderowanie [%s]... %d%% (%zu/%zu kafelków) [czas: %.1f s, fotony: %d]",
-                                 modeTag, percent, done, g_total_tiles, elapsed.count(), g_photon_count);
+                        if (g_render_algo == 4) {
+                            swprintf(status, 180, L"Renderowanie [%s]... %d%% (%zu/%zu kafelków) [czas: %.1f s, sekwencje faset: %d]",
+                                     modeTag, percent, done, g_total_tiles, elapsed.count(), g_manifold_sequences.load());
+                        } else {
+                            swprintf(status, 180, L"Renderowanie [%s]... %d%% (%zu/%zu kafelków) [czas: %.1f s, fotony: %d]",
+                                     modeTag, percent, done, g_total_tiles, elapsed.count(), g_photon_count);
+                        }
                         SetWindowTextW(g_hStatusLabel, status);
                     }
 
@@ -4766,7 +5529,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                         auto now = std::chrono::high_resolution_clock::now();
                         std::chrono::duration<double> elapsed = now - g_render_start_time;
 
-                        const wchar_t* modeTag = (g_render_algo == 4) ? L"MEMLT" : ((g_render_algo == 3) ? L"MLT" : ((g_render_algo == 2) ? L"BDPT" : ((g_render_algo == 1) ? L"GPU CUDA" : L"CPU PT")));
+                        const wchar_t* modeTag = (g_render_algo == 4) ? L"MNEE" : ((g_render_algo == 3) ? L"MLT" : ((g_render_algo == 2) ? L"BDPT" : ((g_render_algo == 1) ? L"GPU CUDA" : L"CPU PT")));
                         const wchar_t* oidnTag = g_is_currently_denoised ? L" [Intel OIDN: włączony]" : L" [OIDN: wyłączony]";
                         wchar_t status[220];
 
@@ -4780,7 +5543,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                                 swprintf(status, 220, L"[GPU CUDA] Renderowanie ukończone w %.2f s! Rozdzielczość: %dx%d px (%d SPP)%s.",
                                          elapsed.count(), g_render_width, g_render_height, total, oidnTag);
                             }
-                        } else if (g_render_algo == 3 || g_render_algo == 4) {
+                        } else if (g_render_algo == 3) {
                             size_t done = g_mlt_mutations_done.load();
                             size_t total = g_mlt_total_mutations.load();
                             SendMessage(g_hProgressBar, PBM_SETPOS, 1000, 0);
@@ -4829,7 +5592,7 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
             else if (wmId == IDC_COMBO_ALGO && wmEvent == CBN_SELCHANGE) {
                 int sel = static_cast<int>(SendMessage(g_hComboAlgo, CB_GETCURSEL, 0, 0));
                 g_render_algo = sel;
-                if (sel == 3 || sel == 4) {
+                if (sel == 3) {
                     SetWindowTextW(g_hLblSPP, L"Mutacje na piksel:");
                     EnableWindow(g_hComboTile, FALSE);
                 } else if (sel == 1) {
@@ -4956,10 +5719,51 @@ LRESULT CALLBACK MainWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) 
                     SetWindowTextW(g_hStatusLabel, L"Kaustyka GPU CUDA: Wyłączona (transparentne cienie szkła – brak czarnej plamy).");
                 }
             }
+            else if (wmId == IDC_BTN_CAUSTIC_APPLY || (wmId == IDC_COMBO_CAUSTIC_GRID && wmEvent == CBN_SELCHANGE)) {
+                auto readFloat = [](HWND hEdit, float def, float lo, float hi) {
+                    wchar_t buf[64];
+                    GetWindowTextW(hEdit, buf, 64);
+                    for (wchar_t* c = buf; *c; ++c) if (*c == L',') *c = L'.';
+                    float val = def;
+                    try { val = std::stof(buf); } catch (...) {}
+                    val = std::clamp(val, lo, hi);
+                    wchar_t out[32];
+                    swprintf(out, 32, hi <= 0.5f ? L"%.3f" : L"%.2f", val);
+                    SetWindowTextW(hEdit, out);
+                    return val;
+                };
+                g_caustic_blur_cm.store(readFloat(g_hEditCausticBlur, 0.25f, 0.0f, 5.0f));
+                g_caustic_light_size.store(readFloat(g_hEditCausticLight, 0.12f, 0.0f, 1.0f));
+                g_caustic_gain.store(readFloat(g_hEditCausticGain, 1.0f, 0.0f, 20.0f));
+                g_caustic_cpu_radius.store(readFloat(g_hEditCausticRadius, 0.028f, 0.004f, 0.3f));
+                static const int grid_sizes[3] = {1024, 2048, 4096};
+                int gsel = std::clamp(static_cast<int>(SendMessage(g_hComboCausticGrid, CB_GETCURSEL, 0, 0)), 0, 2);
+                g_caustic_grid_res.store(grid_sizes[gsel]);
+
+                wchar_t pbuf[32];
+                GetWindowTextW(g_hEditPhotons, pbuf, 32);
+                int photons = wcstol(pbuf, nullptr, 10);
+                if (photons >= 1000) g_photon_count = std::min(photons, 8000000);
+
+                g_viewport_pt_spp = 0;
+                CudaPT_ResetViewportAccum();
+                if (g_live_viewport_pt.load()) {
+                    RenderLiveViewportFrame(false);
+                    InvalidateRect(g_hCanvas, NULL, FALSE);
+                }
+                wchar_t st[220];
+                swprintf(st, 220, L"Kaustyka: rozmycie %.2f cm | źródło %.2f | jasność %.2fx | siatka GPU %d | promień CPU %.3f m (CPU: widoczne po ponownym renderze).",
+                         g_caustic_blur_cm.load(), g_caustic_light_size.load(), g_caustic_gain.load(), g_caustic_grid_res.load(), g_caustic_cpu_radius.load());
+                SetWindowTextW(g_hStatusLabel, st);
+            }
             else if (wmId == IDC_CHK_CAUSTICS_HQ) {
                 LRESULT checked = SendMessage(g_hChkCausticsHQ, BM_GETCHECK, 0, 0);
                 bool enable = (checked == BST_CHECKED);
                 g_cuda_caustics_hq.store(enable);
+                g_caustic_grid_res.store(enable ? 2048 : 1024);
+                SendMessage(g_hComboCausticGrid, CB_SETCURSEL, enable ? 1 : 0, 0);
+                g_viewport_pt_spp = 0;
+                CudaPT_ResetViewportAccum();
                 if (enable) {
                     SetWindowTextW(g_hStatusLabel, L"Tryb kaustyki dla renderu: Precyzyjny HD (siatka 2048x2048, 1M fotonów).");
                 } else {
@@ -5075,7 +5879,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                               hFocus == g_hEditRadius || hFocus == g_hEditFilename || hFocus == g_hEditPhotons ||
                               hFocus == g_hEditSPP || hFocus == g_hEditDepth || hFocus == g_hEditResW || hFocus == g_hEditResH ||
                               hFocus == g_hEditMatR || hFocus == g_hEditMatG || hFocus == g_hEditMatB || hFocus == g_hEditMatParam ||
-                              hFocus == g_hEditExposure || hFocus == g_hEditLightPower);
+                              hFocus == g_hEditExposure || hFocus == g_hEditLightPower ||
+                              hFocus == g_hEditCausticBlur || hFocus == g_hEditCausticLight || hFocus == g_hEditCausticGain ||
+                              hFocus == g_hEditCausticRadius);
 
             if (!isEditing && !g_is_grabbing && (msg.wParam == 'Z' || msg.wParam == 'z')) {
                 ToggleLiveViewportPT();

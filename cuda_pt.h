@@ -97,6 +97,11 @@ struct CudaRenderOptions {
     int caustic_photons = 262144; // Liczba fotonów kaustyki GPU z dyspersją Cauchy'ego
     int caustic_hq = 1; // 1 = Wysoka precyzja (2048x2048 HD, ostre wstęgi), 0 = Szybki podgląd (1024x1024)
     int scene_mode = 0; // 0 = Scena otwarta, 1 = Pokój ze zwierciadłem
+    // Parametry ostrości kaustyki GPU
+    int caustic_grid_res = 0;          // Rozdzielczość siatki fotonów (1024 / 2048 / 4096); 0 = wg caustic_hq
+    float caustic_blur_cm = 0.25f;     // Sigma filtru Gaussa siatki kaustyki [cm na podłożu]; 0 = brak rozmycia
+    float caustic_light_size = 0.12f;  // Ułamek promienia źródła światła emitujący fotony (0 = punktowe, 1 = pełny emiter)
+    float caustic_gain = 1.0f;         // Mnożnik jasności kaustyki
 };
 
 // Sprawdzenie dostępności urządzenia NVIDIA CUDA

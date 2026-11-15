@@ -753,7 +753,8 @@ extern "C" __global__ void emit_caustic_photons_kernel(
     const GPUCrystal* crystals, int num_crystals, const GPUPlane* crystal_planes,
     const GPUSphere* spheres, int num_spheres,
     const GPUQuad* quads, int num_quads,
-    unsigned int base_seed
+    unsigned int base_seed,
+    float light_size
 ) {
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     if (tid >= num_photons) return;
@@ -794,7 +795,7 @@ extern "C" __global__ void emit_caustic_photons_kernel(
     Vec3 obj_color = is_crystal_target ? crystals[crystal_idx].color : spheres[ds_idx].color;
 
     // Skupiona emisja z rdzenia źródła światła (eliminuje 24-stopniowy blur wielkiego emitera o średnicy 1.7 m)
-    Vec3 p_light = light.center + (light.radius * 0.12f) * random_unit_vector(rng);
+    Vec3 p_light = light.center + (light.radius * light_size) * random_unit_vector(rng);
 
     // Promień początkowy w stożku skierowanym na cel
     Vec3 light_to_target = target_center - light.center;
@@ -924,7 +925,9 @@ extern "C" __global__ void emit_caustic_photons_kernel(
     float cell_area = cell_w * cell_h;
 
     Vec3 deposit = photon_flux * (1.0f / (3.14159265f * cell_area));
-    float max_deposit = 120.0f;
+    // Limit pojedynczego fotonu skalowany dla siatek gęstszych niż 2048x2048 (zachowanie jasności ostrych skupień)
+    float ref_area = (11.0f / 2048.0f) * (11.0f / 2048.0f);
+    float max_deposit = 120.0f * fmaxf(1.0f, ref_area / cell_area);
     float dep_lum = fmaxf(deposit.x, fmaxf(deposit.y, deposit.z));
     if (dep_lum > max_deposit) deposit = deposit * (max_deposit / dep_lum);
 
@@ -961,27 +964,42 @@ extern "C" __global__ void emit_caustic_photons_kernel(
     atomicAdd(&caustic_b[z1 * grid_w + x1], deposit.z * w11);
 }
 
-// Filtr wygładzający siatkę kaustyki z zachowaniem kontrastu ostrych krawędzi skupień (0.02 ms)
+// Filtr Gaussa siatki kaustyki o regulowanej sigmie (w komórkach siatki) i wzmocnieniu jasności.
+// sigma_cells <= 0.05 -> brak rozmycia (surowa, najostrzejsza kaustyka)
 extern "C" __global__ void filter_caustic_map_kernel(
     const float* in_r, const float* in_g, const float* in_b,
     float* out_r, float* out_g, float* out_b,
-    int grid_w, int grid_h
+    int grid_w, int grid_h,
+    float sigma_cells, float gain
 ) {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int z = blockIdx.y * blockDim.y + threadIdx.y;
     if (x >= grid_w || z >= grid_h) return;
 
+    int out_idx = z * grid_w + x;
+    if (sigma_cells <= 0.05f) {
+        out_r[out_idx] = in_r[out_idx] * gain;
+        out_g[out_idx] = in_g[out_idx] * gain;
+        out_b[out_idx] = in_b[out_idx] * gain;
+        return;
+    }
+
+    int rad = (int)ceilf(2.5f * sigma_cells);
+    if (rad < 1) rad = 1;
+    if (rad > 8) rad = 8;
+    float inv_2s2 = 1.0f / (2.0f * sigma_cells * sigma_cells);
+
     float r_sum = 0.0f, g_sum = 0.0f, b_sum = 0.0f;
     float w_total = 0.0f;
 
-    for (int dz = -1; dz <= 1; ++dz) {
+    for (int dz = -rad; dz <= rad; ++dz) {
         int cz = z + dz;
         if (cz < 0 || cz >= grid_h) continue;
-        for (int dx = -1; dx <= 1; ++dx) {
+        for (int dx = -rad; dx <= rad; ++dx) {
             int cx = x + dx;
             if (cx < 0 || cx >= grid_w) continue;
 
-            float w = (dx == 0 && dz == 0) ? 0.65f : ((dx == 0 || dz == 0) ? 0.065f : 0.0225f);
+            float w = expf(-(float)(dx * dx + dz * dz) * inv_2s2);
             int idx = cz * grid_w + cx;
             r_sum += in_r[idx] * w;
             g_sum += in_g[idx] * w;
@@ -990,16 +1008,10 @@ extern "C" __global__ void filter_caustic_map_kernel(
         }
     }
 
-    if (w_total > 1e-4f) {
-        r_sum /= w_total;
-        g_sum /= w_total;
-        b_sum /= w_total;
-    }
-
-    int out_idx = z * grid_w + x;
-    out_r[out_idx] = r_sum;
-    out_g[out_idx] = g_sum;
-    out_b[out_idx] = b_sum;
+    float norm = (w_total > 1e-6f) ? (gain / w_total) : 0.0f;
+    out_r[out_idx] = r_sum * norm;
+    out_g[out_idx] = g_sum * norm;
+    out_b[out_idx] = b_sum * norm;
 }
 )";
 
@@ -1246,8 +1258,8 @@ bool CudaPT_Render(
 
     // Alokacja i obliczenie mapy kaustyki GPU z dyspersją Cauchy'ego
     int enable_caustics = options.enable_caustics;
-    int caustic_w = options.caustic_hq ? 2048 : 1024;
-    int caustic_h = options.caustic_hq ? 2048 : 1024;
+    int caustic_w = (options.caustic_grid_res > 0) ? std::clamp(options.caustic_grid_res, 256, 4096) : (options.caustic_hq ? 2048 : 1024);
+    int caustic_h = caustic_w;
     float c_min_x = -5.5f, c_max_x = 5.5f;
     float c_min_z = -5.5f, c_max_z = 5.5f;
     size_t caustic_size = (size_t)caustic_w * caustic_h * sizeof(float);
@@ -1286,6 +1298,9 @@ bool CudaPT_Render(
                 int n_photons = (options.caustic_photons > 0) ? options.caustic_photons : (options.caustic_hq ? 1048576 : 524288);
                 int sc_mode = options.scene_mode;
                 unsigned int c_seed = 987654321u;
+                float c_light_size = std::clamp(options.caustic_light_size, 0.0f, 1.0f);
+                float c_sigma_cells = std::max(0.0f, options.caustic_blur_cm) * 0.01f / ((c_max_x - c_min_x) / (float)caustic_w);
+                float c_gain = std::max(0.0f, options.caustic_gain);
 
                 void* emit_args[] = {
                     &d_caustic_raw_r,
@@ -1308,7 +1323,8 @@ bool CudaPT_Render(
                     &num_spheres,
                     &d_quads,
                     &num_quads,
-                    &c_seed
+                    &c_seed,
+                    &c_light_size
                 };
 
                 cuLaunchKernel(
@@ -1326,7 +1342,9 @@ bool CudaPT_Render(
                     &d_caustic_filtered_g,
                     &d_caustic_filtered_b,
                     &caustic_w,
-                    &caustic_h
+                    &caustic_h,
+                    &c_sigma_cells,
+                    &c_gain
                 };
 
                 cuLaunchKernel(
@@ -1647,11 +1665,21 @@ bool CudaPT_RenderViewportStep(
     }
 
     // Alokacja buforów siatki kaustyki w viewporcie
-    int caustic_w = 1024;
-    int caustic_h = 1024;
+    int caustic_w = (options.caustic_grid_res > 0) ? std::clamp(options.caustic_grid_res, 256, 4096) : 1024;
+    int caustic_h = caustic_w;
     float c_min_x = -5.5f, c_max_x = 5.5f;
     float c_min_z = -5.5f, c_max_z = 5.5f;
     size_t caustic_size = (size_t)caustic_w * caustic_h * sizeof(float);
+    static int s_vp_caustic_res = 0;
+    if (s_vp_caustic_raw_r && s_vp_caustic_res != caustic_w) {
+        // Zmiana rozdzielczości siatki kaustyki -> realokacja buforów i restart akumulacji
+        cuMemFree(s_vp_caustic_raw_r); cuMemFree(s_vp_caustic_raw_g); cuMemFree(s_vp_caustic_raw_b);
+        cuMemFree(s_vp_caustic_filtered_r); cuMemFree(s_vp_caustic_filtered_g); cuMemFree(s_vp_caustic_filtered_b);
+        s_vp_caustic_raw_r = s_vp_caustic_raw_g = s_vp_caustic_raw_b = 0;
+        s_vp_caustic_filtered_r = s_vp_caustic_filtered_g = s_vp_caustic_filtered_b = 0;
+        inout_accum_spp = 0;
+    }
+    s_vp_caustic_res = caustic_w;
     if (!s_vp_caustic_raw_r) {
         cuMemAlloc(&s_vp_caustic_raw_r, caustic_size);
         cuMemAlloc(&s_vp_caustic_raw_g, caustic_size);
@@ -1747,6 +1775,9 @@ bool CudaPT_RenderViewportStep(
             int n_photons = (options.caustic_photons > 0) ? options.caustic_photons : 262144;
             int sc_mode = options.scene_mode;
             unsigned int c_seed = 987654321u + s_vp_seed_counter;
+            float c_light_size = std::clamp(options.caustic_light_size, 0.0f, 1.0f);
+            float c_sigma_cells = std::max(0.0f, options.caustic_blur_cm) * 0.01f / ((c_max_x - c_min_x) / (float)caustic_w);
+            float c_gain = std::max(0.0f, options.caustic_gain);
 
             void* emit_args[] = {
                 &s_vp_caustic_raw_r,
@@ -1769,7 +1800,8 @@ bool CudaPT_RenderViewportStep(
                 &s_vp_num_spheres,
                 &s_vp_quads,
                 &s_vp_num_quads,
-                &c_seed
+                &c_seed,
+                &c_light_size
             };
 
             cuLaunchKernel(
@@ -1787,7 +1819,9 @@ bool CudaPT_RenderViewportStep(
                 &s_vp_caustic_filtered_g,
                 &s_vp_caustic_filtered_b,
                 &caustic_w,
-                &caustic_h
+                &caustic_h,
+                &c_sigma_cells,
+                &c_gain
             };
 
             cuLaunchKernel(

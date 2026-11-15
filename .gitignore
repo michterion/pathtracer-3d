@@ -1,0 +1,26 @@
+# Compiled binaries & object files
+*.exe
+*.o
+*.obj.bak
+
+# CMake build directories & cache
+build/
+bin/
+out/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+
+# Temporary test renders and outputs
+test_*.png
+output.bmp
+output.png
+output_cuda.png
+
+# IDE & Editor files
+.vscode/
+.vs/
+*.suo
+*.user
+*.log

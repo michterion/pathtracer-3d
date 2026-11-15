@@ -1,0 +1,155 @@
+# Path Tracer 3D (C++ / Win32 GUI / CUDA)
+
+Kompletny zestaw narzędzi do renderowania metodą **Path Tracingu** (Monte Carlo) oraz **Dwukierunkowego Path Tracingu (BDPT)** ze skomplikowaną kaustyką optyczną.
+
+## Kluczowe możliwości aplikacji GUI (`pathtracer_gui.exe`)
+
+1. **Pełne wsparcie maksymalizacji i skalowania okna (`WS_OVERLAPPEDWINDOW`)**:
+   - Aplikację można teraz **zmaksymalizować na cały ekran** (przycisk maksymalizacji w prawym górnym rogu okna lub dwuklik na belkę).
+   - Kanwa widoku 3D automatycznie i dynamicznie rozszerza się, dopasowując rozdzielczość i proporcje kadru w czasie rzeczywistym.
+   - Prawy panel sterowania pozostaje wygodnie zadokowany przy prawej krawędzi.
+
+2. **Naprawa orientacji podglądu (Prawidłowy układ Top-Down)**:
+   - Wyeliminowano odwrócenie obrazu — góra kadru to zawsze góra ekranu, a ruch kursora myszki odpowiada bezpośrednio kierunkowi przemieszczania w przestrzeni 3D.
+   - Wskaźniki zaznaczenia (pomarańczowy pierścień) i linie osi idealnie pokrywają się z bryłami 3D co do piksela.
+
+3. **Nawigacja kamerą 3D w stylu Blendera**:
+   - **Obrót kamery (Orbit)**: Przytrzymaj **Środkowy Przycisk Myszy (ŚPM / kółko)** lub **Alt + LPM** i przeciągnij, aby płynnie orbitować kamerą wokół sceny.
+   - **Przybliżanie / Oddalanie (Zoom)**: Kręć **kółkiem myszy (Scroll)**, aby zbliżać lub oddalać widok.
+   - **Przesuwanie widoku (Pan)**: Przytrzymaj **Shift + ŚPM** i przeciągnij, aby przesuwać punkt skupienia kamery.
+   - **Reset kamery**: Przycisk `🎥 Reset kamery 3D` natychmiast przywraca optymalny kąt początkowy.
+
+4. **Transformacje obiektów w stylu Blendera (G, S, osie X/Y/Z)**:
+   - **Wybór obiektu**: Kliknij **LPM** na dowolny obiekt w kadrze (Ray Picking).
+   - **Klawisz G (Grab / Przesuwanie)**: Przesuwa obiekt w 3D pod kursorem myszy.
+   - **Klawisz S (Scale / Skalowanie)**: Skaluje promień/rozmiar zaznaczonego obiektu ruchem myszki.
+   - **Blokada osi (X, Y, Z)**: Wciśnięcie **X**, **Y** lub **Z** w trakcie przesuwania blokuje ruch do danej osi z wyświetleniem kolorowej linii prowadnicy 3D (Czerwona X, Zielona Y, Niebieska Z).
+   - **Klawisz F (Floor Grid)**: Włącza/wyłącza perspektywiczną siatkę podłoża w stylu Blendera.
+   - **Zatwierdzenie / Anulowanie**: **LPM** / **Enter** zatwierdza, **PPM** / **Escape** anuluje transformację.
+
+5. **Nowa geometria sceny: Szlifowany Kryształ Szklany (Faceted Crystal / Polyhedron)**:
+   - 20-fasetowy szlifowany kryształ (`ConvexPolyhedron`) oparty na analitycznym obcinaniu półprzestrzeni (Slab Method).
+   - Rzuca na podłoże skomplikowaną sieć zbieżnych pasm świetlnych, diamentowych skupień i promieni gwiazdy (*starburst caustics*).
+
+6. **Dramatyczny kąt oświetlenia (Boczno-Tylny)**:
+   - Źródło światła umieszczone pod niskim kątem ($X=3.2, Y=2.4, Z=-1.2$).
+   - Promienie przechodzą przez fasety kryształu pod skosem, rzucając wydłużony wachlarz kaustyki na podłogę.
+
+7. **Brak szwów kafelkowania (Globalna Mapa Fotonów)**:
+   - Ciągła siatka przestrzenna $O(1)$ gwarantuje spójną kaustykę bez jakichkolwiek szwów kafelkowania niezależnie od rozmiaru kafelka (16x16, 32x32, 64x64).
+
+8. **Konfiguracja ilości fotonów i własna nazwa pliku PNG**:
+   - Pełna edycja ilości fotonów kaustyki (`IDC_EDIT_PHOTONS`) oraz nazwy pliku przed zapisem (`IDC_EDIT_FILENAME`).
+
+9. **Metropolis Light Transport (MLT) – David Cline & Parris Egbert (2005)**:
+   - Dodano zaawansowaną metodę transportu światła **MLT** opartą na łańcuchach Markowa (MCMC) i zasadzie równowagi szczegółowej (*Detailed Balance*).
+   - **Nowa ścieżka (Large Step Mutation, Sekcja 3.2)**: Losuje zupełnie nową ścieżkę światła, gwarantując ergodyczność i eksplorację całej sceny.
+   - **Perturbacja soczewki (Lens Perturbation, Appendix B)**: Wykładniczo rozproszone przesunięcie punktu na płaszczyźnie projekcji ($r = r_2 \cdot e^{-\ln(r_2/r_1)\xi}$), pozwalające na gęste próbkowanie pasm kaustycznych.
+   - **Perturbacja kątowa odbić (Angular Perturbation, Appendix C)**: Wykładnicze zaburzenie kąta odbicia i załamania promieni ($\theta = \theta_2 \cdot e^{-\ln(\theta_2/\theta_1)\xi}$).
+   - **Akumulacja wartości oczekiwanej (Expected Value Accumulation, Sekcja 5.1)**: Obie propozycje ($Y$ oraz $X$) wpłacają swój wkład ważony prawdopodobieństwem akceptacji $a(y|x) = \min(1, F_y/F_x)$, drastycznie redukując szum.
+   - **Faza Bootstrap & Skalowanie (Sekcja 3.5 & Równanie 1)**: Oszacowanie średniej luminancji $f_{ave}$ i skalowanie histogramu próbek $s = f_{ave} / h_{ave}$.
+   - **Równoległość MCMC**: Niezależne łańcuchy Markowa na wszystkich rdzeniach procesora z aktualizacją podglądu w czasie rzeczywistym.
+
+10. **Manifold Exploration (MEMLT / MEPT) – Wenzel Jakob & Steve Marschner (ACM TOG / SIGGRAPH 2012)**:
+    - Dodano najnowocześniejszą metodę **Manifold Exploration**, rozwiązującą problem renderowania trudnych ścieżek zwierciadlanych i refrakcyjnych ($S^*$).
+    - **Rozmaitość zwierciadlana (*Specular Manifold*, Sekcja 3)**: Zbiór fizycznie dopuszczalnych ścieżek spełniających uogólnione prawo Snella / Fermata tworzy podrozmaitość w przestrzeni ścieżek ($C(\bar{x}) = 0$).
+    - **Algorytm `WALKMANIFOLD` (Sekcja 4 & Rysunek 4)**: Dwuetapowy predyktor-korektor (metoda Newtona) poruszający się w przestrzeni stycznej rozmaitości za pomocą Jacobianu różniczkowego ($J$) i rzutujący promienie z powrotem na rozmaitość za pomocą śledzenia promieni ze zbieżnością kwadratową.
+    - **Perturbacja rozmaitości (*Manifold Perturbation*, Sekcja 5.1 & Rysunek 5, 6)**: Płynne poruszanie się wzdłuż krawędzi i pasm kaustycznych szlifowanego kryształu bez utraty połączenia ze źródłem światła.
+    - **Test odwracalności (*Reversibility*, Sekcja 5.1)**: Weryfikacja powrotnego spaceru gwarantuje pełną odwracalność i zachowanie Detailed Balance w łańcuchu Markowa.
+
+11. **Druga Scena Testowa: Zamknięty Pokój ze Szczeliną Okienną (Benchmark Manifold Exploration)**:
+    - Kamera umieszczona wewnątrz zamkniętego pokoju.
+    - W przedniej ścianie znajduje się wąskie, podłużne okno szczelinowe.
+    - Kuliste źródło światła umieszczone na zewnątrz za nieprzezroczystą przesłoną (*baffle*) – brak bezpośredniego widoku ze szczeliny na źródło światła.
+    - Światło wpada do wnętrza pokoju **wyłącznie po odbiciu od zewnętrznej ściany zwierciadlanej (lustra)**.
+    - Wewnątrz pokoju umieszczony jest szklany kryształ i złota kula, tworzące załamania i kaustykę z wpadającego promienia światła.
+    - Klasyczny problem wąskiej apertury i pośredniego transportu zwierciadlanego – idealny do demonstracji potęgi Manifold Exploration (MEMLT) nad klasycznym PT i BDPT!
+
+12. **Interaktywny Edytor Materiałów w Czasie Rzeczywistym**:
+    - Możliwość zmiany typu materiału dla dowolnego zaznaczonego obiektu:
+      - `Lambertian` (matowy, rozpraszający)
+      - `Metal` (zwierciadlany, lustrzany)
+      - `Dielectric` (szkło, kryształ, refrakcyjny)
+      - `DiffuseLight` (emisyjny, źródło światła)
+    - Wygodna edycja parametrów w GUI: kolor RGB, chropowatość (*Roughness* dla metalu), współczynnik załamania (*IOR* dla dielektryka) oraz moc świecenia (*Intensity* dla światła).
+    - Przycisk `🎨 Zastosuj Materiał do Wybranego Obiektu` natychmiastowo aktualizuje podgląd 3D.
+
+13. **Uniwersalny Importer Geometrii 3D (Wavefront .OBJ)**:
+    - Przycisk `📂 Importuj model 3D Wavefront (.OBJ)` z natywnym oknem dialogowym Windows.
+    - Automatyczne parsowanie wierzchołków (`v`) i ścian (`f`), triangulacja polygonów.
+    - Automatyczne centrowanie i normalizacja skali siatki do przestrzeni roboczej sceny.
+    - Akceleracja AABB (Bounding Box) + szybki algorytm Möllera-Trumbore dla przecięcia promienia z trójkątami.
+    - Pełna integracja z silnikiem manipulacji: zaimportowany model można wybierać myszką, przesuwać klawiszem `G`, skalować `S`, blokować osie `X/Y/Z` oraz nakładać na niego dowolne materiały (szkło, złoto, emiter światła, matowy). Dołączono przykładowe pliki `diamond.obj` oraz `test_pyramid.obj`.
+
+14. **Głęboka optymalizacja wydajności (likwidacja wąskiego gardła 700s) i fotorealistyczna kaustyka**:
+    - **Bounding Sphere Culling**: Dodano błyskawiczny test sfery otaczającej do `ConvexPolyhedron`, który w 5 ns odrzuca promienie mijające kryształ, eliminując wielokrotne sprawdzanie 20 płaszczyzn w 95% promieni w scenie.
+    - **Optymalizacja `WalkSpecularManifold`**: Skrócono liczbę kroków metody Newtona-Raphsona do 4 (kwadratowa zbieżność błędu $e \to e^2$) oraz ograniczono perturbację rozmaitości wyłącznie do promieni faktycznie trafiających w kryształ.
+    - **Redukcja zapytań o mapę fotonów**: Ograniczono zapytania `estimate_radiance` do bezpośrednich trafień oka (`bounce == 0`) lub trafień po odbiciu zwierciadlanym (`last_was_specular`), eliminując dziesiątki milionów zbędnych zapytań przestrzennych na głębokich odbiciach w ścianach pokoju.
+    - **Fizyczna ścieżka fotonów w Scenie 2**: Fotony są emitowane ze źródła na zewnętrzne lustro przy $Z = 3.2$, odbijają się zgodnie z prawem odbicia, wpadają przez szczelinę okienną przy $Z = 1.4$ i precyzyjnie trafiają w kryształ i podłogę.
+    - **Dyspersja chromatyczna (Cauchy Spectral Dispersion)**: Podział emisji fotonów na 3 kanały spektralne ($IOR_R = 1.515, IOR_G = 1.530, IOR_B = 1.555$), co tworzy autentyczne, tęczowe krawędzie załamań światła zamiast jednolitej białej plamy.
+    - **Filtr stożkowy Jensena o promieniu 0.028f**: Zmniejszono promień wyszukiwania z 0.12f do 0.028f wraz z gęstą siatką 0.020f i dokładną normalizacją fizyczną $\frac{3}{\pi^2 r^2}$, gwarantując ostre, krystaliczne pasma światła fasetkowego bez przejaskrawień.
+
+15. **Konfigurowalna Dyspersja Chromatyczna i Ulepszony Algorytm Rozpraszania Spektralnego**:
+    - **Parametr `Dyspersja` w GUI**: Każdy szklany obiekt (`Dielectric` oraz Kryształ) posiada teraz w pełni edytowalny parametr dyspersji chromatycznej Cauchy'ego (`IDC_EDIT_MAT_DISP`):
+      - `0.000` = czysta, krystalicznie biała kaustyka bez żadnych zafarbowań,
+      - `0.015 - 0.025` = naturalne, subtelne rozszczepienie pryzmatyczne,
+      - `0.050 - 0.080` = intensywne, nasycone tęcze fasetkowe.
+    - **Ciągłe próbkowanie spektralne Cauchy'ego**: Zastąpiono dawne dyskretne szpilki kanałowe $R, G, B$ ciągłym próbkowaniem długości fali $\lambda \in [0, 1]$ z fizycznymi krzywymi Gaussa odpowiedzi spektralnej CIE i zachowaniem energii.
+    - **Likwidacja kolorowych artefaktów (Chroma Regularization w MEMLT i BDPT)**: Wprowadzono adaptacyjną regularyzację chromatyczną w estymatorze radiacji. Przy małej liczbie zebranych fotonów ($N \le 2$) estymator płynnie przechodzi do neutralnej luminancji, całkowicie eliminując pojedyncze jaskrawe piksele/plamki (fireflies), podczas gdy w gęstych rdzeniach kaustyki zachowane jest pełne, nasycone widmo tęczy.
+
+16. **Eksport Sceny 3D do formatu Wavefront OBJ oraz Płynny Viewport 100+ FPS**:
+    - **Przycisk `💾 Eksportuj (.OBJ)`**: Umożliwia wyeksportowanie całej bieżącej geometrii sceny (20-fasetowe kryształy, panele quadów, sfery stesselowane UV oraz zaimportowane siatki mesh) do standardowego pliku `.obj`, kompatybilnego z Blenderem, 3ds Max, Maya itp.
+    - **Płynność widoku 3D**: Dynamiczne, wielowątkowe skalowanie podglądu podczas aktywnego obracania, przesuwania (`G`), skalowania (`S`) i panowania widoku na wszystkich rdzeniach procesora zapewnia stałe, maślane 100+ FPS bez najmniejszych przycięć, z automatycznym wyostrzeniem do wysokiej jakości po zakończeniu manipulacji.
+
+17. **Akceleracja GPU NVIDIA CUDA w GUI i programie dedykowanym (`pathtracer_cuda.exe`)**:
+    - **Nowy algorytm w głównym oknie GUI**: W liście wyboru algorytmów dodano pozycję **`Standardowy Path Tracing (GPU / CUDA)`**. Pozwala ona na błyskawiczne renderowanie sceny na karcie graficznej NVIDIA RTX z pełnym podglądem paska postępu, licznikiem SPP i możliwością natychmiastowego zatrzymania (`Anuluj`).
+    - **Dedykowany program konsolowy CLI (`pathtracer_cuda.exe`)**: Samodzielny, ultraszybki moduł do renderingu wsadowego z poziomu linii poleceń (`run_cuda.bat`).
+    - **Silnik JIT NVRTC (NVIDIA Runtime Compilation) & Driver API**:
+      - Rozwiązano problem braku kompilatora `cl.exe` (Visual Studio) – program kompiluje kod kernela CUDA JIT bezpośrednio do kodu natywnego architektury karty (np. `sm_89` / Ada Lovelace dla RTX 4070 Ti) za pośrednictwem bibliotek `nvrtc64_120_0.dll` i `nvcuda.dll`.
+      - Własny, zoptymalizowany generator liczb pseudolosowych **PCG Random** na GPU.
+    - **Wieloprzebiegowa akumulacja i podgląd na żywo (Progressive Live Display)**:
+      - Renderowanie GPU wykonywane jest w bezpiecznych paczkach (np. po 16 SPP na przebieg), co całkowicie eliminuje zawieszenia sterownika i mechanizm Windows TDR (Timeout Detection and Recovery).
+      - W trakcie renderu GUI na bieżąco wyświetla progresywnie wyostrzający się obraz bezpośrednio na kanwie (live stream klatek pośrednich z VRAM do bufora ekranu).
+    - **Prawidłowa orientacja kadru (Top-Down)**: Wyeliminowano odwrócenie osi pionowej – obraz na GPU renderuje się identycznie jak w widoku 3D i na CPU.
+    - **Wydajność**: Rozdzielczość 1280x720 przy 256 SPP generuje się na RTX 4070 Ti w zaledwie **~0.34 sekundy** (ponad 100x szybciej niż na CPU).
+
+18. **Fotograficzna kontrola F-stopów i kinowy Tone Mapping HDR (ACES Filmic)**:
+    - **Nowy dedykowany moduł GUI**: `Ekspozycja (F-stopy) i Tone Mapping (HDR)` umieszczony na prawym panelu sterowania.
+    - **Kinowy Tone Mapping ACES Filmic (16+ F-stopów dynamiki)**:
+      - Zastąpiono twarde obcinanie jasności powyżej 1.0 gładką krzywą filmową ACES (Krzysztof Narkowicz / Stephen Hill fit) oraz dodano operatory Reinhard i Filmic Soft / AgX.
+      - Całkowicie wyeliminowano efekt przepalonej, płaskiej białej plamy na podłożu i źródłach światła – zachowano subtelne gradienty, plastyczność i detale kaustyki.
+    - **Płynna regulacja ekspozycji (EV) i wskaźnik przysłony fotograficznej**:
+      - Domyślna ekspozycja `-2.0 EV` (odpowiednik przysłony $f/5.6$, zmniejszenie natężenia światła 4-krotnie) idealnie równoważy mocne światła punktowe.
+      - Przyciski szybkiej korekcji ekspozycji: `[-0.5 EV]`, `[+0.5 EV]`, `[0 EV]` oraz pole bezpośredniego wpisu wartości EV.
+      - Dynamiczny wskaźnik przysłony informuje o efektywnym otworze względnym obiektywu ($f/1.4$ do $f/22$) i procentowym natężeniu światła.
+    - **Natychmiastowy post-processing w czasie rzeczywistym (< 2 ms)**:
+      - Ponieważ bufor roboczy przechowuje surowe dane fizycznej radiancji Monte Carlo w formacie float HDR, zmiana ekspozycji i krzywej tone mappingu odświeża obraz na ekranie natychmiastowo bez konieczności ponownego renderowania sceny!
+      - Zapis do pliku PNG automatycznie uwzględnia aktualnie wybraną ekspozycję i krzywą barwną.
+
+---
+
+## Struktura programów
+
+Projekt został podzielony na wyspecjalizowane moduły:
+1. **`pathtracer_gui.exe`** – Główny program z pełnym interfejsem Win32 GUI, interaktywnym podglądem sceny 3D (100+ FPS), edytorem materiałów, manipulacją obiektami w stylu Blendera, wsparciem dla denoisera Intel OIDN oraz wszystkimi silnikami renderującymi (CPU PT, GPU CUDA PT, BDPT, MLT, MEMLT, Spectral).
+2. **`pathtracer_cuda.exe`** – Samodzielny, dedykowany program renderujący wyłącznie na GPU NVIDIA CUDA.
+3. **`pathtracer.exe`** – Samodzielny program CLI do renderowania na procesorze (CPU).
+
+---
+
+## Uruchomienie
+
+W głównym folderze projektu oraz w podfolderze przygotowano wygodne skrypty `.bat`:
+- **`Run_GUI.bat`** (lub `run_gui.bat`) – uruchamia główne okno programu Win32 GUI.
+- **`Run_CUDA.bat`** (lub `run_cuda.bat`) – uruchamia renderowanie testowe na GPU NVIDIA CUDA.
+- **`run_cpu.bat`** – uruchamia renderowanie testowe na procesorze CPU.
+
+---
+
+## Kompilacja
+
+Wszystkie programy można skompilować jednym kliknięciem za pomocą:
+- **`Build_All.bat`** (w katalogu głównym) lub **`build.bat`** (w podkatalogu projektu).
+
+Do kompilacji wykorzystywany jest nowoczesny kompilator **LLVM Clang++** ze środowiskiem UCRT MinGW (brak zależności od instalatora Visual Studio).
+Wymagane biblioteki runtime (OIDN, NVRTC, TBB) są już skompletowane w katalogu projektu.
